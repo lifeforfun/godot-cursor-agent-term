@@ -125,15 +125,27 @@ func _add_btn(parent: Node, text: String, cb: Callable) -> void:
 	parent.add_child(b)
 
 
+func _focus_vte() -> void:
+	if not _use_vte or _vte == null:
+		return
+	_vte.focus()
+
+
 func _on_slot_gui_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton and event.pressed:
 		if _use_vte and _vte and _vte.is_running() and _term_placed:
-			_vte.focus()
+			_focus_vte()
 			_dbg("G-PANEL", "slot-click-focus")
 
 
 func _input(event: InputEvent) -> void:
+	## VTE 路径：Ctrl+V 只由 vte_host 在终端持焦时处理。
+	## 这里若再全局拦截，会把脚本编辑器里的粘贴偷进终端。
+	if _use_vte:
+		return
 	if not visible or not is_visible_in_tree():
+		return
+	if not _panel_slot_active():
 		return
 	if not (event is InputEventKey and event.pressed and not event.echo):
 		return
@@ -143,16 +155,8 @@ func _input(event: InputEvent) -> void:
 	if not k.ctrl_pressed:
 		return
 	if not _session_alive():
-		_dbg("G-PASTE", "skip", {"reason": "no-session"})
 		return
-	if _use_vte and _vte:
-		var err: Error = _vte.paste()
-		_dbg("G-PASTE", "vte-paste", {"err": err, "shift": k.shift_pressed})
-		if err == OK:
-			get_viewport().set_input_as_handled()
-			_vte.focus()
-			_set_status("已粘贴")
-		return
+	# screen 回退：仅本页签激活时把剪贴板打进会话
 	var text := DisplayServer.clipboard_get()
 	if text.is_empty():
 		return
@@ -379,8 +383,9 @@ func _apply_placed_geom() -> bool:
 	return true
 
 
-func _ensure_placed(force_restart_host: bool) -> void:
-	## 铺 VTE 到当前槽位；force_restart_host 时杀掉旧 python 再起。
+func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
+	## 铺 VTE 到当前槽位；默认不抢键盘（Alt+Tab / 几何同步只铺窗）。
+	## grab_focus：开启会话等主动操作才为 true。
 	if not _use_vte or _vte == null:
 		_set_status("无 VTE")
 		return
@@ -416,9 +421,9 @@ func _ensure_placed(force_restart_host: bool) -> void:
 	_apply_placed_geom()
 	await get_tree().create_timer(0.1).timeout
 	_apply_placed_geom()
-	if _vte:
-		_vte.focus()
-	_dbg("G-PLACE", "ok", {"restart": force_restart_host, "w": _last_geom.size.x, "h": _last_geom.size.y})
+	if grab_focus:
+		_focus_vte()
+	_dbg("G-PLACE", "ok", {"restart": force_restart_host, "grab": grab_focus, "w": _last_geom.size.x, "h": _last_geom.size.y})
 
 
 func _on_start_session() -> void:
@@ -428,9 +433,7 @@ func _on_start_session() -> void:
 	await _start_session_async(true, false)
 	if _use_vte:
 		if _panel_slot_active():
-			await _ensure_placed(false)
-			if _vte:
-				_vte.focus()
+			await _ensure_placed(false, true)
 		else:
 			if _vte and _vte.is_running():
 				_vte.hide()
@@ -493,10 +496,10 @@ func _start_session_async(resume: bool, force_new: bool) -> void:
 	if _use_vte:
 		if _term_placed:
 			_apply_placed_geom()
-			_vte.focus()
+			_focus_vte()
 			_set_status("resume=%s" % (resume_id if not resume_id.is_empty() else "新会话"))
 		elif _panel_slot_active():
-			await _ensure_placed(false)
+			await _ensure_placed(false, true)
 		else:
 			_vte.hide()
 			_set_status("会话已开 · 回到本页签即铺终端")
@@ -571,7 +574,7 @@ func _on_inject_path() -> void:
 		return
 	var err: Error = _write_to_agent("\n" + notation + "\n")
 	if err == OK and _use_vte and _vte:
-		_vte.focus()
+		_focus_vte()
 	_set_status("已注入 %s" % notation if err == OK else "注入失败")
 
 
@@ -581,7 +584,7 @@ func _on_scroll_bottom() -> void:
 			_set_status("会话未启动")
 			return
 		_vte.scroll_bottom()
-		_vte.focus()
+		_focus_vte()
 		return
 	_on_open_terminal()
 

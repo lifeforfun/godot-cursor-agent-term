@@ -113,7 +113,8 @@ class Host:
 		self.win.set_decorated(False)
 		self.win.set_skip_taskbar_hint(True)
 		self.win.set_skip_pager_hint(True)
-		self.win.set_accept_focus(True)
+		# 默认不接受 WM 焦点（减少 Alt+Tab 落到叠窗）；点击时再打开。不主动抢/还焦点。
+		self.win.set_accept_focus(False)
 		self.win.set_can_focus(True)
 		self.win.set_keep_above(False)
 		self.win.set_focus_on_map(False)
@@ -127,6 +128,7 @@ class Host:
 		self.win.connect("destroy", Gtk.main_quit)
 		self.win.connect("button-press-event", self._on_win_button)
 		self.win.connect("configure-event", self._on_configure)
+		self.win.connect("focus-out-event", self._on_focus_out)
 
 		self.term = Vte.Terminal()
 		self.term.set_can_focus(True)
@@ -134,8 +136,9 @@ class Host:
 		self.term.set_input_enabled(True)
 		self.term.set_cursor_blink_mode(Vte.CursorBlinkMode.ON)
 		self.term.set_scrollback_lines(10000)
-		self.term.set_scroll_on_output(True)
-		self.term.set_scroll_on_keystroke(True)
+		# 不跟输出/按键滚到底，滚动条完全手动；要到底用工具栏「滚到底部」
+		self.term.set_scroll_on_output(False)
+		self.term.set_scroll_on_keystroke(False)
 		# 禁止 VTE 按行列自行 size_request 撑破宿主窗口
 		try:
 			self.term.set_property("geometry-hints", None)
@@ -157,7 +160,6 @@ class Host:
 		self._clamp_armed = False
 		self._xclip_proc: subprocess.Popen | None = None
 		self._paste_gen = 0
-
 	def _apply_font(self) -> None:
 		for desc in _FONT_CANDIDATES:
 			try:
@@ -409,12 +411,33 @@ class Host:
 			time.sleep(0.04)
 		return last_n
 
-	def _focus_term(self) -> None:
+	def _event_time(self) -> int:
 		try:
-			self.win.present()
+			t = int(Gtk.get_current_event_time() or 0)
+			if t:
+				return t
+		except Exception:
+			pass
+		return 0
+
+	def _focus_term(self) -> None:
+		"""用户点终端 / 显式 focus：临时允许接键盘。不 present、不抢 Godot。"""
+		try:
+			self.win.set_accept_focus(True)
+			gdk_win = self.win.get_window()
+			if gdk_win is not None:
+				gdk_win.focus(self._event_time())
 			self.term.grab_focus()
 		except Exception:
 			pass
+
+	def _on_focus_out(self, _w, _e) -> bool:
+		# 失焦后不再接受 WM 焦点；不调用 parent.focus，交给系统
+		try:
+			self.win.set_accept_focus(False)
+		except Exception:
+			pass
+		return False
 
 	def _on_win_button(self, _w, _e) -> bool:
 		self._focus_term()
@@ -424,12 +447,27 @@ class Host:
 		self._focus_term()
 		return False
 
+	def _copy_selection(self) -> bool:
+		"""Ctrl+Shift+C：复制选区到 CLIPBOARD。Ctrl+C 不拦截，留给 agent 中断。"""
+		try:
+			if not self.term.get_has_selection():
+				_dbg("H-COPY", "no-selection")
+				return True
+			if hasattr(self.term, "copy_clipboard_format"):
+				self.term.copy_clipboard_format(Vte.Format.TEXT)
+			else:
+				self.term.copy_clipboard()
+			_dbg("H-COPY", "ok")
+		except Exception as e:  # noqa: BLE001
+			_dbg("H-COPY", "fail", err=str(e))
+		return True
+
 	def _on_key_press(self, _widget, event) -> bool:
 		state = event.state & Gtk.accelerator_get_default_mod_mask()
 		ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
 		shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
 		# 调试：记录可能相关的按键（Ctrl/Shift 组合）
-		if ctrl or shift or event.keyval in (Gdk.KEY_v, Gdk.KEY_V, Gdk.KEY_Return):
+		if ctrl or shift or event.keyval in (Gdk.KEY_v, Gdk.KEY_V, Gdk.KEY_c, Gdk.KEY_C, Gdk.KEY_Return):
 			_dbg(
 				"H-KEY",
 				"key-press",
@@ -446,6 +484,9 @@ class Host:
 				_dbg("H-KEY", "sent-shift-enter")
 				return True
 			return False
+		# Ctrl+Shift+C / Ctrl+Insert：复制选中；Ctrl+C 原样放行（中断思考）
+		if ctrl and shift and event.keyval in (Gdk.KEY_c, Gdk.KEY_C, Gdk.KEY_Insert):
+			return self._copy_selection()
 		# Ctrl+V / Ctrl+Shift+V：对齐 GoLand
 		# - 有图 → 规范化 PNG + 0x16（触发 agent 贴图芯片）
 		# - 有文本 → 直接写入 PTY（终端默认 Ctrl+V 只会发 0x16，agent 不贴文本）
@@ -670,6 +711,10 @@ class Host:
 			self._visible = False
 			self._last_geom = (None, None, None, None)
 			self._clamp_armed = False
+			try:
+				self.win.set_accept_focus(False)
+			except Exception:
+				pass
 
 	def scroll_bottom(self) -> None:
 		adj = self.term.get_vadjustment()
@@ -707,7 +752,7 @@ class Host:
 			if ok:
 				self._child_pid = int(pid)
 				self._emit({"event": "spawned", "pid": self._child_pid})
-				GLib.idle_add(self._focus_term_idle)
+				# 不在 spawn 后自动抢焦点；由开会话 / 点击终端显式 focus
 				# TUI 启动常改行列，延迟再钉回槽位
 				if self._visible and self._last_geom[0] is not None:
 					GLib.idle_add(self._reclamp_last)
