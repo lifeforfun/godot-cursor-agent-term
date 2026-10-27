@@ -6,8 +6,6 @@ const SessionStoreScript := preload("res://addons/cursor_agent_term/session_stor
 const LauncherScript := preload("res://addons/cursor_agent_term/launcher.gd")
 const EditorCtxScript := preload("res://addons/cursor_agent_term/editor_ctx.gd")
 const PlatScript := preload("res://addons/cursor_agent_term/plat.gd")
-## 仅当槽位贴着窗口底边时才让出底栏页签条（侧栏 dock 不扣）
-const TAB_BAR_RESERVE_PX := 44
 const GEOM_EPS_PX := 3
 
 var _plat
@@ -345,7 +343,7 @@ func _is_current_tab_page() -> bool:
 
 
 func _slot_screen_rect() -> Rect2i:
-	## 只量内嵌 ColorRect；底栏贴边时才让出页签条，侧栏不扣。
+	## 只量内嵌 ColorRect（工具栏以下的槽位）。页签在 dock 控件外，不再额外扣底边。
 	var gr := _slot.get_global_rect()
 	var vp := get_viewport()
 	var win_id: int = vp.get_window_id() if vp else 0
@@ -358,13 +356,6 @@ func _slot_screen_rect() -> Rect2i:
 	var y := win_pos.y + int(round(gr.position.y * sy))
 	var w := maxi(1, int(round(gr.size.x * sx)))
 	var h := maxi(1, int(round(gr.size.y * sy)))
-	# 槽位底边靠近窗口底 → 视为底栏，让出页签
-	var slot_bottom := y + h
-	var win_bottom := win_pos.y + win_size.y
-	if slot_bottom >= win_bottom - TAB_BAR_RESERVE_PX - 8:
-		var max_bottom := win_bottom - TAB_BAR_RESERVE_PX
-		if slot_bottom > max_bottom:
-			h = maxi(1, max_bottom - y)
 	if w < 8 or h < 8:
 		return Rect2i()
 	return Rect2i(x, y, w, h)
