@@ -86,3 +86,26 @@ func agent_path_candidates() -> PackedStringArray:
 func agent_abs_candidates() -> PackedStringArray:
 	## 绝对路径候选（如 /Applications/...）
 	return PackedStringArray()
+
+
+func slot_screen_rect(slot: Control) -> Rect2i:
+	## 槽位 → 屏幕像素矩形（左上原点、y 向下）。Linux 默认实现；macOS 覆盖。
+	if slot == null or not is_instance_valid(slot):
+		return Rect2i()
+	var gr: Rect2 = slot.get_global_rect()
+	var vp: Viewport = slot.get_viewport()
+	if vp == null:
+		return Rect2i()
+	var win_id: int = vp.get_window_id()
+	var win_pos := DisplayServer.window_get_position(win_id)
+	var win_size := DisplayServer.window_get_size(win_id)
+	var vp_size: Vector2 = vp.get_visible_rect().size
+	var sx := float(win_size.x) / maxf(vp_size.x, 1.0)
+	var sy := float(win_size.y) / maxf(vp_size.y, 1.0)
+	var x := win_pos.x + int(round(gr.position.x * sx))
+	var y := win_pos.y + int(round(gr.position.y * sy))
+	var w := maxi(1, int(round(gr.size.x * sx)))
+	var h := maxi(1, int(round(gr.size.y * sy)))
+	if w < 8 or h < 8:
+		return Rect2i()
+	return Rect2i(x, y, w, h)

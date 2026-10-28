@@ -95,15 +95,12 @@ check_os() {
   local uname_s
   uname_s="$(uname -s 2>/dev/null || echo unknown)"
   case "$uname_s" in
-    Linux) ;;
-    Darwin)
-      err "当前为 macOS：插件终端宿主尚未实现（仅 Linux）。请在 Linux 桌面环境安装。"
-      ;;
+    Linux|Darwin) ;;
     MINGW*|MSYS*|CYGWIN*|Windows_NT)
-      err "当前为 Windows：插件终端宿主尚未实现（仅 Linux）。请在 Linux 桌面环境安装。"
+      err "当前为 Windows：插件终端宿主尚未实现（支持 Linux / macOS）。请在 Linux 或 macOS 安装。"
       ;;
     *)
-      err "不支持的系统：$uname_s（目前仅支持 Linux）"
+      err "不支持的系统：$uname_s（目前支持 Linux / macOS）"
       ;;
   esac
 }
@@ -118,6 +115,56 @@ check_plugin_src() {
   if [[ ! -f "$SRC/cursor_agent_term/vte_host.py" ]]; then
     err "缺少 vte_host.py（Linux 内嵌终端宿主）"
   fi
+  local uname_s
+  uname_s="$(uname -s 2>/dev/null || echo unknown)"
+  if [[ "$uname_s" == "Darwin" ]]; then
+    if [[ ! -f "$SRC/cursor_agent_term/macos_embed_host.py" ]]; then
+      err "缺少 macos_embed_host.py（macOS 内嵌终端宿主）"
+    fi
+    if [[ ! -f "$SRC/cursor_agent_term/macos_xterm/index.html" ]]; then
+      err "缺少 macos_xterm/index.html（macOS xterm 资源）"
+    fi
+  fi
+}
+
+macos_venv_dir() {
+  printf '%s\n' "${GCAT_MACOS_VENV:-$HOME/.cache/cursor-agent-term/macos-venv}"
+}
+
+macos_venv_python() {
+  local d
+  d="$(macos_venv_dir)"
+  if [[ -x "$d/bin/python" ]]; then
+    printf '%s\n' "$d/bin/python"
+    return 0
+  fi
+  return 1
+}
+
+ensure_macos_embed_venv() {
+  ## 创建/修复 macOS 内嵌宿主专用 venv（PyObjC）。失败不直接 err，由检测函数汇总。
+  local venv py_base
+  venv="$(macos_venv_dir)"
+  if macos_venv_python >/dev/null 2>&1; then
+    if "$(macos_venv_python)" -c 'from AppKit import NSWindow; import WebKit' >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  py_base=""
+  local c
+  for c in python3.11 python3.12 python3.13 python3; do
+    if have_cmd "$c"; then py_base="$(command -v "$c")"; break; fi
+  done
+  if [[ -z "$py_base" ]]; then
+    return 1
+  fi
+  mkdir -p "$(dirname "$venv")"
+  if [[ ! -x "$venv/bin/python" ]]; then
+    "$py_base" -m venv "$venv" || return 1
+  fi
+  "$venv/bin/pip" install -q -U pip >/dev/null 2>&1 || true
+  "$venv/bin/pip" install -q 'pyobjc-framework-Cocoa' 'pyobjc-framework-WebKit' 'pyobjc-framework-Quartz' || return 1
+  "$(macos_venv_python)" -c 'from AppKit import NSWindow; import WebKit; from Quartz import CGWindowListCopyWindowInfo' >/dev/null 2>&1
 }
 
 check_project() {
@@ -209,7 +256,7 @@ check_python() {
   fi
 }
 
-check_term_runtime() {
+check_term_runtime_linux() {
   local vte_ok=0 screen_ok=0 term_ok=0
 
   if have_cmd python3; then
@@ -254,6 +301,50 @@ PY
   fi
 }
 
+check_term_runtime_macos() {
+  local embed_ok=0 mux_ok=0 term_ok=0
+
+  if ensure_macos_embed_venv; then
+    embed_ok=1
+  else
+    warn "macOS 内嵌宿主 venv 未就绪（PyObjC）：将尝试外挂 tmux/screen 回退。手动：python3 -m venv ~/.cache/cursor-agent-term/macos-venv && pip install pyobjc-framework-Cocoa pyobjc-framework-WebKit"
+  fi
+
+  if have_cmd tmux || have_cmd screen; then
+    mux_ok=1
+  fi
+
+  if [[ -d /System/Applications/Utilities/Terminal.app ]] \
+    || [[ -d /Applications/Utilities/Terminal.app ]] \
+    || [[ -d /Applications/Terminal.app ]] \
+    || [[ -d /Applications/iTerm.app ]]; then
+    term_ok=1
+  fi
+  local t
+  for t in kitty alacritty wezterm; do
+    if have_cmd "$t"; then term_ok=1; break; fi
+  done
+
+  if (( embed_ok == 1 )); then
+    :
+  elif (( mux_ok == 1 && term_ok == 1 )); then
+    warn "无 macOS 内嵌叠窗：将使用 tmux/screen + 系统终端回退"
+  elif (( mux_ok == 1 && term_ok == 0 )); then
+    err "有 tmux/screen 但未找到 Terminal.app / iTerm / kitty；请修好内嵌 venv 或安装终端"
+  else
+    err "macOS 运行环境不足：需要内嵌宿主（PyObjC venv）或「tmux/screen + Terminal.app」"
+  fi
+}
+
+check_term_runtime() {
+  local uname_s
+  uname_s="$(uname -s 2>/dev/null || echo unknown)"
+  case "$uname_s" in
+    Darwin) check_term_runtime_macos ;;
+    *) check_term_runtime_linux ;;
+  esac
+}
+
 run_checks() {
   echo "=== 环境检测（Cursor Agent Term）==="
   echo "插件源: $PLUGIN_ROOT"
@@ -274,13 +365,27 @@ run_checks() {
   echo "  系统:      $(uname -s) $(uname -m 2>/dev/null || true)"
   echo "  python3:   $(command -v python3 2>/dev/null || echo 无)"
   echo "  agent:     $agent_show"
-  if have_cmd python3 && python3 -c 'import gi; gi.require_version("Gtk","3.0"); gi.require_version("Vte","2.91"); from gi.repository import Gtk,Vte' >/dev/null 2>&1; then
-    echo "  内嵌 VTE:  可用"
-  else
-    echo "  内嵌 VTE:  不可用"
-  fi
-  echo "  screen:    $(command -v screen 2>/dev/null || echo 无)"
-  echo "  xclip:     $(command -v xclip 2>/dev/null || echo 无)"
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin)
+      if py="$(macos_venv_python 2>/dev/null)" && "$py" -c 'from AppKit import NSWindow; import WebKit' >/dev/null 2>&1; then
+        echo "  内嵌叠窗:  可用 ($py)"
+      else
+        echo "  内嵌叠窗:  不可用"
+      fi
+      echo "  tmux:      $(command -v tmux 2>/dev/null || echo 无)"
+      echo "  screen:    $(command -v screen 2>/dev/null || echo 无)"
+      echo "  Terminal:  $( [[ -d /System/Applications/Utilities/Terminal.app || -d /Applications/Utilities/Terminal.app || -d /Applications/Terminal.app ]] && echo 有 || echo 无 )"
+      ;;
+    *)
+      if have_cmd python3 && python3 -c 'import gi; gi.require_version("Gtk","3.0"); gi.require_version("Vte","2.91"); from gi.repository import Gtk,Vte' >/dev/null 2>&1; then
+        echo "  内嵌 VTE:  可用"
+      else
+        echo "  内嵌 VTE:  不可用"
+      fi
+      echo "  screen:    $(command -v screen 2>/dev/null || echo 无)"
+      echo "  xclip:     $(command -v xclip 2>/dev/null || echo 无)"
+      ;;
+  esac
   echo
 
   if [[ ${#WARNINGS[@]} -gt 0 ]]; then

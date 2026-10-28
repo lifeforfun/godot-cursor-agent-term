@@ -1,7 +1,7 @@
 @tool
 class_name CursorAgentEditorCtx
 extends RefCounted
-## 采集当前脚本路径与选区行号，拼成 @path 或 @path:start-end。
+## 采集当前脚本路径与选区行号，拼成 [path] 或 [path:start-end]。
 
 const LauncherScript := preload("res://addons/cursor_agent_term/launcher.gd")
 
@@ -12,8 +12,8 @@ static func collect_at_notation() -> String:
 		return ""
 	var path: String = str(ref.get("path", "")).replace(" ", "\\ ")
 	if ref.has("start") and ref.has("end"):
-		return "@%s:%d-%d" % [path, int(ref["start"]), int(ref["end"])]
-	return "@%s" % path
+		return "[%s:%d-%d]" % [path, int(ref["start"]), int(ref["end"])]
+	return "[%s]" % path
 
 
 static func collect() -> Dictionary:

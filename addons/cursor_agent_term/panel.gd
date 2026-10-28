@@ -55,7 +55,9 @@ func _dbg(tag: String, msg: String, extra: Dictionary = {}) -> void:
 	var d := {"t": Time.get_time_string_from_system(), "tag": tag, "msg": msg}
 	for k in extra:
 		d[k] = extra[k]
-	var path := OS.get_temp_dir().path_join("gcat_vte_debug.log")
+	var path := OS.get_temp_dir().path_join(
+		"gcat_macos_debug.log" if OS.get_name() == "macOS" else "gcat_vte_debug.log"
+	)
 	var f := FileAccess.open(path, FileAccess.READ_WRITE)
 	if f == null:
 		f = FileAccess.open(path, FileAccess.WRITE)
@@ -114,13 +116,30 @@ func _add_btn(parent: Node, text: String, cb: Callable) -> void:
 	var b := Button.new()
 	b.text = text
 	b.focus_mode = Control.FOCUS_NONE
-	b.flat = true
+	b.flat = false
 	b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	b.custom_minimum_size = Vector2(0, 20)
-	b.add_theme_constant_override("h_separation", 2)
-	b.add_theme_font_size_override("font_size", 11)
+	b.custom_minimum_size = Vector2(0, 26)
+	b.add_theme_constant_override("h_separation", 4)
+	b.add_theme_font_size_override("font_size", 13)
+	# 深色 dock 里默认按钮边容易糊掉，显式描边
+	b.add_theme_stylebox_override("normal", _btn_style(Color(0.16, 0.16, 0.16, 1), Color(0.55, 0.55, 0.55, 1)))
+	b.add_theme_stylebox_override("hover", _btn_style(Color(0.22, 0.22, 0.22, 1), Color(0.72, 0.72, 0.72, 1)))
+	b.add_theme_stylebox_override("pressed", _btn_style(Color(0.12, 0.12, 0.12, 1), Color(0.85, 0.85, 0.85, 1)))
 	b.pressed.connect(cb)
 	parent.add_child(b)
+
+
+func _btn_style(bg: Color, border: Color) -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = bg
+	sb.set_border_width_all(1)
+	sb.border_color = border
+	sb.set_corner_radius_all(3)
+	sb.content_margin_left = 8
+	sb.content_margin_right = 8
+	sb.content_margin_top = 3
+	sb.content_margin_bottom = 3
+	return sb
 
 
 func _focus_vte() -> void:
@@ -343,27 +362,27 @@ func _is_current_tab_page() -> bool:
 
 
 func _slot_screen_rect() -> Rect2i:
-	## 只量内嵌 ColorRect（工具栏以下的槽位）。页签在 dock 控件外，不再额外扣底边。
-	var gr := _slot.get_global_rect()
-	var vp := get_viewport()
-	var win_id: int = vp.get_window_id() if vp else 0
-	var win_pos := DisplayServer.window_get_position(win_id)
-	var win_size := DisplayServer.window_get_size(win_id)
-	var vp_size: Vector2 = vp.get_visible_rect().size if vp else Vector2(win_size)
-	var sx := float(win_size.x) / maxf(vp_size.x, 1.0)
-	var sy := float(win_size.y) / maxf(vp_size.y, 1.0)
-	var x := win_pos.x + int(round(gr.position.x * sx))
-	var y := win_pos.y + int(round(gr.position.y * sy))
-	var w := maxi(1, int(round(gr.size.x * sx)))
-	var h := maxi(1, int(round(gr.size.y * sy)))
-	if w < 8 or h < 8:
-		return Rect2i()
-	return Rect2i(x, y, w, h)
+	## 槽位屏幕矩形：交由 plat（Linux 原公式；macOS 用 screen_transform 防 HiDPI 算飞）
+	if _plat != null and _plat.has_method("slot_screen_rect"):
+		var r: Rect2i = _plat.slot_screen_rect(_slot)
+		_dbg("G-GEOM", "slot", {"x": r.position.x, "y": r.position.y, "w": r.size.x, "h": r.size.y, "os": _plat.os_id()})
+		return r
+	return Rect2i()
 
 
 func _apply_placed_geom() -> bool:
 	if _vte == null or not _vte.is_running() or not _vte.is_attached():
 		return false
+	# macOS：相对槽位（宿主用 CGWindow 对齐）；其它平台：绝对屏幕矩形
+	if _vte.has_method("set_slot_geom") and _plat != null and _plat.has_method("slot_geom_dict"):
+		var d: Dictionary = _plat.slot_geom_dict(_slot)
+		if d.is_empty() or float(d.get("fw", 0)) <= 0.0 or float(d.get("fh", 0)) <= 0.0:
+			_dbg("G-GEOM", "slot-too-small", {})
+			return false
+		_last_geom = Rect2i(int(d.get("x", 0)), int(d.get("y", 0)), int(d.get("w", 0)), int(d.get("h", 0)))
+		_vte.set_slot_geom(d)
+		_dbg("G-GEOM", "place-rel", d)
+		return true
 	var r := _slot_screen_rect()
 	if r.size.x < 8 or r.size.y < 8:
 		_dbg("G-GEOM", "slot-too-small", {})
