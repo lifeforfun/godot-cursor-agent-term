@@ -74,7 +74,7 @@ func _exit_tree() -> void:
 
 
 func _build_ui() -> void:
-	# 自身铺满 dock；工具栏尽量矮，把高度留给终端槽位
+	# 自身铺满 dock；工具栏贴底，上方高度全给终端槽位
 	set_anchors_and_offsets_preset(PRESET_FULL_RECT)
 	size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -86,19 +86,7 @@ func _build_ui() -> void:
 	root.add_theme_constant_override("separation", 2)
 	add_child(root)
 
-	var bar := HBoxContainer.new()
-	bar.add_theme_constant_override("separation", 2)
-	bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	bar.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
-	root.add_child(bar)
-
-	_add_btn(bar, "开启会话", Callable(self, "_on_start_session"))
-	_add_btn(bar, "注入路径", Callable(self, "_on_inject_path"))
-	_add_btn(bar, "滚到底部", Callable(self, "_on_scroll_bottom"))
-	if not _use_vte:
-		_add_btn(bar, "打开终端", Callable(self, "_on_open_terminal"))
-
-	# 状态只打日志，不占 UI 行（小 dock 要把高度留给终端）
+	# 状态只打日志，不占 UI 行
 	_status = null
 
 	_slot = ColorRect.new()
@@ -111,12 +99,25 @@ func _build_ui() -> void:
 	_slot.item_rect_changed.connect(func() -> void: on_dock_geom_event("slot-rect"))
 	root.add_child(_slot)
 
+	var bar := HBoxContainer.new()
+	bar.add_theme_constant_override("separation", 10)
+	bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bar.size_flags_vertical = Control.SIZE_SHRINK_END
+	root.add_child(bar)
+
+	_add_btn(bar, "开启会话", Callable(self, "_on_start_session"))
+	_add_btn(bar, "注入路径", Callable(self, "_on_inject_path"))
+	_add_btn(bar, "滚到底部", Callable(self, "_on_scroll_bottom"))
+	if not _use_vte:
+		_add_btn(bar, "打开终端", Callable(self, "_on_open_terminal"))
+
 
 func _add_btn(parent: Node, text: String, cb: Callable) -> void:
 	var b := Button.new()
 	b.text = text
 	b.focus_mode = Control.FOCUS_NONE
 	b.flat = false
+	b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	b.custom_minimum_size = Vector2(0, 26)
 	b.add_theme_constant_override("h_separation", 4)
