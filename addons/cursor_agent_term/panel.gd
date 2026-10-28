@@ -201,7 +201,8 @@ func _set_status(t: String) -> void:
 
 
 func _process(_delta: float) -> void:
-	## 只轮询 VTE TCP；尺寸/显隐改走 on_* 事件
+	## 轮询内嵌宿主 TCP；并缓存脚本选区（点按钮失焦前）
+	EditorCtxScript.refresh_cache()
 	if _use_vte and _vte:
 		_vte.poll_event()
 
@@ -576,12 +577,13 @@ func _write_to_agent(text: String) -> Error:
 
 
 func _on_inject_path() -> void:
-	if not _ensure_session():
-		_set_status("会话未启动")
-		return
+	# 先采路径/选区（点按钮易失焦丢选区；缓存见 editor_ctx），再确保会话
 	var notation: String = EditorCtxScript.collect_at_notation()
 	if notation.is_empty():
 		_set_status("请先打开脚本")
+		return
+	if not _ensure_session():
+		_set_status("会话未启动")
 		return
 	var err: Error = _write_to_agent("\n" + notation + "\n")
 	if err == OK and _use_vte and _vte:
