@@ -321,7 +321,15 @@ def main() -> None:
 
 		def _on_resign_key(self) -> None:
 			self._accept_keys = False
+			self._apply_input_passthrough()
 			_dbg("H-FOCUS", "resign")
+
+		def _apply_input_passthrough(self) -> None:
+			## 未接键时穿透鼠标，避免 Floating 叠窗挡住 Godot 下拉/选项弹层
+			try:
+				self.win.setIgnoresMouseEvents_(not self._accept_keys)
+			except Exception as e:  # noqa: BLE001
+				_dbg("H-FOCUS", "passthrough-fail", err=str(e))
 
 		def _sync_front_app(self, reason: str = "") -> None:
 			## 只 orderFront/Out，绝不 makeKey / activate（避免 show 时抢焦点）
@@ -332,6 +340,7 @@ def main() -> None:
 				except Exception:
 					pass
 				self._visible = True
+				self._apply_input_passthrough()
 			else:
 				self._accept_keys = False
 				try:
@@ -600,6 +609,7 @@ def main() -> None:
 			self._want_visible = False
 			self._last_geom = None
 			self._accept_keys = False
+			self._apply_input_passthrough()
 			try:
 				self.win.orderOut_(None)
 			except Exception:
@@ -620,6 +630,7 @@ def main() -> None:
 				return
 			try:
 				self._accept_keys = True
+				self._apply_input_passthrough()
 				self.app.activateIgnoringOtherApps_(True)
 				self.win.makeKeyAndOrderFront_(None)
 				try:

@@ -24,6 +24,8 @@ var _term_placed: bool = false
 var _was_panel_active: bool = false
 var _geom_sync_queued: bool = false
 var _editor_ready_seen: bool = false
+## 编辑器 Popup/对话框打开时隐藏浮层，避免挡住且看不见（全平台）
+var _overlay_suppressed_by_popup: bool = false
 
 
 func _ready() -> void:
@@ -205,6 +207,51 @@ func _process(_delta: float) -> void:
 	EditorCtxScript.refresh_cache()
 	if _use_vte and _vte:
 		_vte.poll_event()
+		_update_popup_suppress()
+
+
+func _update_popup_suppress() -> void:
+	## 有可见编辑器弹层时藏浮层；关掉后若本页签仍在再铺回
+	if not _use_vte or _vte == null or not _vte.is_running():
+		if _overlay_suppressed_by_popup:
+			_overlay_suppressed_by_popup = false
+		return
+	var block := _editor_blocks_overlay()
+	if block:
+		if not _overlay_suppressed_by_popup:
+			_overlay_suppressed_by_popup = true
+			_vte.hide()
+			_dbg("G-POPUP", "suppress")
+		return
+	if not _overlay_suppressed_by_popup:
+		return
+	_overlay_suppressed_by_popup = false
+	_dbg("G-POPUP", "restore")
+	if _panel_slot_active() and _term_placed:
+		_apply_placed_geom()
+
+
+func _editor_blocks_overlay() -> bool:
+	## PopupMenu / 对话框等会盖在 dock 上；Tooltip 忽略以免抖闪
+	var tree := get_tree()
+	if tree == null or tree.root == null:
+		return false
+	return _scan_blocking_popup(tree.root, 0)
+
+
+func _scan_blocking_popup(n: Node, depth: int) -> bool:
+	if n == null or depth > 40:
+		return false
+	if n is Popup:
+		var cls := n.get_class()
+		if cls != "TooltipPanel" and (n as Window).visible:
+			return true
+	elif n is AcceptDialog and (n as Window).visible:
+		return true
+	for c in n.get_children():
+		if _scan_blocking_popup(c, depth + 1):
+			return true
+	return false
 
 
 func _on_visibility_changed() -> void:
@@ -263,6 +310,11 @@ func _refresh_active_from_event(reason: String) -> void:
 			_vte.hide()
 		_set_status("已切到其它页签 · 终端已隐藏")
 		return
+	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
+		_overlay_suppressed_by_popup = true
+		if _vte.is_running():
+			_vte.hide()
+		return
 	if _term_placed and _vte.is_running():
 		_apply_placed_geom()
 		_set_status("已回到 Cursor Agent")
@@ -295,6 +347,8 @@ func _run_geom_sync(reason: String) -> void:
 
 
 func _sync_geom_if_changed(reason: String) -> void:
+	if _overlay_suppressed_by_popup:
+		return
 	if not _term_placed or _vte == null or not _vte.is_running() or not _vte.is_attached():
 		return
 	var r := _slot_screen_rect()
@@ -373,6 +427,8 @@ func _slot_screen_rect() -> Rect2i:
 
 
 func _apply_placed_geom() -> bool:
+	if _overlay_suppressed_by_popup:
+		return false
 	if _vte == null or not _vte.is_running() or not _vte.is_attached():
 		return false
 	# macOS：相对槽位（宿主用 CGWindow 对齐）；其它平台：绝对屏幕矩形
@@ -400,6 +456,11 @@ func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 	## grab_focus：开启会话等主动操作才为 true。
 	if not _use_vte or _vte == null:
 		_set_status("无 VTE")
+		return
+	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
+		_overlay_suppressed_by_popup = true
+		if _vte.is_running():
+			_vte.hide()
 		return
 	if not _panel_slot_active():
 		_set_status("请先打开 Cursor Agent 页签/dock")
