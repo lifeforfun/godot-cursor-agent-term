@@ -564,7 +564,7 @@ func _schedule_adopt(require_fresh: bool) -> void:
 func _ensure_session() -> bool:
 	if _session_alive():
 		return true
-	_start_session_async(true, false)
+	await _start_session_async(true, false)
 	return _session_alive()
 
 
@@ -582,7 +582,7 @@ func _on_inject_path() -> void:
 	if notation.is_empty():
 		_set_status("请先打开脚本")
 		return
-	if not _ensure_session():
+	if not await _ensure_session():
 		_set_status("会话未启动")
 		return
 	var err: Error = _write_to_agent("\n" + notation + "\n")
