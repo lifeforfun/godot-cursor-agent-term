@@ -211,7 +211,7 @@ func _process(_delta: float) -> void:
 
 
 func _update_popup_suppress() -> void:
-	## 有可见编辑器弹层时藏浮层；关掉后若本页签仍在再铺回
+	## 有可见临时 UI 时藏浮层；关掉后若本页签仍在再铺回
 	if not _use_vte or _vte == null or not _vte.is_running():
 		if _overlay_suppressed_by_popup:
 			_overlay_suppressed_by_popup = false
@@ -220,8 +220,9 @@ func _update_popup_suppress() -> void:
 	if block:
 		if not _overlay_suppressed_by_popup:
 			_overlay_suppressed_by_popup = true
-			_vte.hide()
 			_dbg("G-POPUP", "suppress")
+		# 弹层期间保持藏：macOS Floating NSPanel 会盖住主窗内嵌入弹层
+		_vte.hide()
 		return
 	if not _overlay_suppressed_by_popup:
 		return
@@ -231,27 +232,50 @@ func _update_popup_suppress() -> void:
 		_apply_placed_geom()
 
 
-func _editor_blocks_overlay() -> bool:
-	## PopupMenu / 对话框等会盖在 dock 上；Tooltip 忽略以免抖闪
+func _editor_tree_root() -> Node:
+	var base: Control = EditorInterface.get_base_control()
+	if base != null and base.get_tree() != null:
+		return base.get_tree().root
 	var tree := get_tree()
-	if tree == null or tree.root == null:
-		return false
-	return _scan_blocking_popup(tree.root, 0)
+	return tree.root if tree != null else null
 
 
-func _scan_blocking_popup(n: Node, depth: int) -> bool:
-	if n == null or depth > 40:
+func _editor_blocks_overlay() -> bool:
+	## 只认引擎临时 UI 原语（Popup / Dialog / exclusive / ColorPicker），
+	## 用 find_children 全树检索。嵌入子窗勿碰 DisplayServer.window_*（macOS 会报错）。
+	var root := _editor_tree_root()
+	if root == null:
 		return false
-	if n is Popup:
-		var cls := n.get_class()
-		if cls != "TooltipPanel" and (n as Window).visible:
+	var main_win: Window = get_window()
+	# 1) 引擎弹层窗（取色器是 PopupPanel；右键是 PopupMenu；对话框是 AcceptDialog…）
+	for cls_name in ["PopupPanel", "PopupMenu", "Popup", "AcceptDialog", "ConfirmationDialog", "FileDialog"]:
+		for node in root.find_children("*", cls_name, true, false):
+			if not (node is Window):
+				continue
+			var w := node as Window
+			if w == main_win or not w.visible:
+				continue
+			if _is_tooltip_window(w):
+				continue
 			return true
-	elif n is AcceptDialog and (n as Window).visible:
-		return true
-	for c in n.get_children():
-		if _scan_blocking_popup(c, depth + 1):
+	# 2) exclusive 子弹窗（勿对嵌入子窗调 DisplayServer.window_*：macOS 会报 !windows.has）
+	for node in root.find_children("*", "Window", true, false):
+		if not (node is Window):
+			continue
+		var w2 := node as Window
+		if w2 == main_win or not w2.visible or _is_tooltip_window(w2):
+			continue
+		if w2.exclusive:
+			return true
+	# 3) 可见的 ColorPicker（懒创建，只有弹开才在树里可见）
+	for node in root.find_children("*", "ColorPicker", true, false):
+		if node is CanvasItem and (node as CanvasItem).is_visible_in_tree():
 			return true
 	return false
+
+func _is_tooltip_window(w: Window) -> bool:
+	var cls := w.get_class()
+	return cls == "TooltipPanel" or cls.begins_with("Tooltip")
 
 
 func _on_visibility_changed() -> void:
@@ -349,7 +373,10 @@ func _run_geom_sync(reason: String) -> void:
 func _sync_geom_if_changed(reason: String) -> void:
 	## 必须与 _apply_placed_geom 同路径（macOS rel / 其它 abs）。
 	## 旧逻辑 sync 时 set_geom 绝对坐标，HiDPI 下会漂到槽位左边。
-	if _overlay_suppressed_by_popup:
+	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
+		_overlay_suppressed_by_popup = true
+		if _vte != null and _vte.is_running():
+			_vte.hide()
 		return
 	if not _term_placed or _vte == null or not _vte.is_running() or not _vte.is_attached():
 		return
@@ -428,7 +455,11 @@ func _slot_screen_rect() -> Rect2i:
 
 
 func _apply_placed_geom() -> bool:
-	if _overlay_suppressed_by_popup:
+	# 现场再判一次：避免几何同步抢在 suppress 标志之前把叠窗又 show 出来
+	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
+		_overlay_suppressed_by_popup = true
+		if _vte != null and _vte.is_running():
+			_vte.hide()
 		return false
 	if _vte == null or not _vte.is_running() or not _vte.is_attached():
 		return false

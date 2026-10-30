@@ -625,8 +625,8 @@ def main() -> None:
 				_dbg("H-GEOM", "show-fail", err=str(e))
 
 		def hide(self) -> None:
+			## 只藏窗，保留 _last_geom，便于弹层关闭后立刻按原几何 show
 			self._want_visible = False
-			self._last_geom = None
 			self._accept_keys = False
 			self._apply_input_passthrough()
 			try:
