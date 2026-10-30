@@ -347,6 +347,8 @@ func _run_geom_sync(reason: String) -> void:
 
 
 func _sync_geom_if_changed(reason: String) -> void:
+	## 必须与 _apply_placed_geom 同路径（macOS rel / 其它 abs）。
+	## 旧逻辑 sync 时 set_geom 绝对坐标，HiDPI 下会漂到槽位左边。
 	if _overlay_suppressed_by_popup:
 		return
 	if not _term_placed or _vte == null or not _vte.is_running() or not _vte.is_attached():
@@ -356,9 +358,8 @@ func _sync_geom_if_changed(reason: String) -> void:
 		return
 	if _geom_near(_last_geom, r):
 		return
-	_last_geom = r
-	_vte.set_geom(r.position.x, r.position.y, r.size.x, r.size.y)
-	_dbg("G-GEOM", "sync", {"reason": reason, "x": r.position.x, "y": r.position.y, "w": r.size.x, "h": r.size.y})
+	if _apply_placed_geom():
+		_dbg("G-GEOM", "sync", {"reason": reason, "x": _last_geom.position.x, "y": _last_geom.position.y, "w": _last_geom.size.x, "h": _last_geom.size.y})
 
 
 func _geom_near(a: Rect2i, b: Rect2i) -> bool:

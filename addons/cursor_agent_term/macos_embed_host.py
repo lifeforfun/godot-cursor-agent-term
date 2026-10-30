@@ -413,6 +413,7 @@ def main() -> None:
 
 		def _quartz_godot_bounds(self):
 			## CGWindow 坐标：主屏左上为原点、y 向下（与 Godot screen 系不同）。
+			## 优先编辑器窗（标题含 Godot Engine）；避免 F5 游戏窗抢锚导致浮层漂到槽位左边。
 			try:
 				from Quartz import (  # noqa: WPS433
 					CGWindowListCopyWindowInfo,
@@ -428,7 +429,7 @@ def main() -> None:
 				_dbg("H-GEOM", "quartz-list-fail", err=str(e))
 				return None
 			best = None
-			best_area = 0
+			best_score = -1.0
 			for info in wins or []:
 				d = dict(info)
 				name = str(d.get("kCGWindowOwnerName") or "")
@@ -438,13 +439,31 @@ def main() -> None:
 				if not b:
 					continue
 				bd = dict(b)
-				area = float(bd.get("Width") or 0) * float(bd.get("Height") or 0)
+				w = float(bd.get("Width") or 0)
+				h = float(bd.get("Height") or 0)
+				area = w * h
 				layer = int(d.get("kCGWindowLayer") or 0)
-				if layer != 0:
+				if layer != 0 or area < 32 * 32:
 					continue
-				if area > best_area:
-					best_area = area
+				title = str(d.get("kCGWindowName") or "")
+				# 编辑器标题常见 "… - Godot Engine"；游戏窗多是项目名/场景名
+				is_editor = ("Godot Engine" in title) or title.endswith(".godot")
+				score = area + (1.0e12 if is_editor else 0.0)
+				if score > best_score:
+					best_score = score
 					best = bd
+			if best is not None:
+				_dbg(
+					"H-GEOM",
+					"quartz-pick",
+					editor_bias=best_score >= 1.0e12,
+					bounds=(
+						float(best.get("X") or 0),
+						float(best.get("Y") or 0),
+						float(best.get("Width") or 0),
+						float(best.get("Height") or 0),
+					),
+				)
 			return best
 
 		def _quartz_to_cocoa(self, qx: float, qy: float, qw: float, qh: float):
