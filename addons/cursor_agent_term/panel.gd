@@ -247,17 +247,15 @@ func _editor_tree_root() -> Node:
 
 func _editor_blocks_overlay() -> bool:
 	## 运行项目：游戏窗让路。
-	## 弹层：大对话框一律藏；PopupMenu/PopupPanel 仅当内容与终端槽位相交才藏。
-	## 避免「树上残留可见标记」导致永久黑槽、宿主永不启动。
+	## 任意可见 Popup*/Dialog/exclusive：macOS Floating 叠窗会盖住嵌入弹层，必须整窗 hide。
+	## 不做「与槽位相交」判断（坐标系易漏，如下拉菜单被挡）。
+	## 宿主仍可在 suppress 时启动（见 _ensure_placed），避免黑槽。
 	if EditorInterface.is_playing_scene():
 		return true
 	var root := _editor_tree_root()
 	if root == null:
 		return false
 	var main_win: Window = get_window()
-	var slot_r := Rect2()
-	if _slot != null and is_instance_valid(_slot):
-		slot_r = _slot.get_global_rect()
 	for cls_name in ["PopupPanel", "PopupMenu", "Popup", "AcceptDialog", "ConfirmationDialog", "FileDialog"]:
 		for node in root.find_children("*", cls_name, true, false):
 			if not (node is Window):
@@ -265,25 +263,16 @@ func _editor_blocks_overlay() -> bool:
 			var w := node as Window
 			if w == main_win or not w.visible or _is_tooltip_window(w):
 				continue
-			if w is AcceptDialog or w is FileDialog:
-				return true
-			if w.exclusive:
-				return true
-			if slot_r.size.x < 1.0 or slot_r.size.y < 1.0:
-				return true
-			if _window_content_intersects_slot(w, slot_r):
-				return true
+			return true
+	for node in root.find_children("*", "Window", true, false):
+		if not (node is Window):
+			continue
+		var w2 := node as Window
+		if w2 == main_win or not w2.visible or _is_tooltip_window(w2):
+			continue
+		if w2.exclusive:
+			return true
 	return false
-
-
-func _window_content_intersects_slot(w: Window, slot_r: Rect2) -> bool:
-	for ch in w.get_children():
-		if ch is Control:
-			var c := ch as Control
-			if c.is_visible_in_tree() and c.get_global_rect().intersects(slot_r):
-				return true
-	var wr := Rect2(Vector2(w.position), Vector2(w.size))
-	return wr.size.x >= 8.0 and wr.size.y >= 8.0 and wr.intersects(slot_r)
 
 
 func _is_tooltip_window(w: Window) -> bool:
