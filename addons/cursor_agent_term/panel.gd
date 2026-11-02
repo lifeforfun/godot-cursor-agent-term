@@ -212,7 +212,7 @@ func _process(_delta: float) -> void:
 
 func _update_popup_suppress() -> void:
 	## 有可见临时 UI 时藏浮层；关掉后若本页签仍在再铺回
-	if not _use_vte or _vte == null or not _vte.is_running():
+	if not _use_vte or _vte == null:
 		if _overlay_suppressed_by_popup:
 			_overlay_suppressed_by_popup = false
 		return
@@ -221,15 +221,20 @@ func _update_popup_suppress() -> void:
 		if not _overlay_suppressed_by_popup:
 			_overlay_suppressed_by_popup = true
 			_dbg("G-POPUP", "suppress")
-		# 弹层期间保持藏：macOS Floating NSPanel 会盖住主窗内嵌入弹层
-		_vte.hide()
+		if _vte.is_running():
+			_vte.hide()
 		return
 	if not _overlay_suppressed_by_popup:
 		return
 	_overlay_suppressed_by_popup = false
 	_dbg("G-POPUP", "restore")
-	if _panel_slot_active() and _term_placed:
+	if not _panel_slot_active():
+		return
+	# 启动时若一直被误判挡住，_term_placed 可能仍是 false，需补铺
+	if _term_placed and _vte.is_running():
 		_apply_placed_geom()
+	else:
+		_ensure_placed(false)
 
 
 func _editor_tree_root() -> Node:
@@ -241,40 +246,45 @@ func _editor_tree_root() -> Node:
 
 
 func _editor_blocks_overlay() -> bool:
-	## 只认引擎临时 UI 原语（Popup / Dialog / exclusive / ColorPicker），
-	## 用 find_children 全树检索。嵌入子窗勿碰 DisplayServer.window_*（macOS 会报错）。
-	## 运行/调试项目时游戏窗也在前台，叠窗需让路。
+	## 运行项目：游戏窗让路。
+	## 弹层：大对话框一律藏；PopupMenu/PopupPanel 仅当内容与终端槽位相交才藏。
+	## 避免「树上残留可见标记」导致永久黑槽、宿主永不启动。
 	if EditorInterface.is_playing_scene():
 		return true
 	var root := _editor_tree_root()
 	if root == null:
 		return false
 	var main_win: Window = get_window()
-	# 1) 引擎弹层窗（取色器是 PopupPanel；右键是 PopupMenu；对话框是 AcceptDialog…）
+	var slot_r := Rect2()
+	if _slot != null and is_instance_valid(_slot):
+		slot_r = _slot.get_global_rect()
 	for cls_name in ["PopupPanel", "PopupMenu", "Popup", "AcceptDialog", "ConfirmationDialog", "FileDialog"]:
 		for node in root.find_children("*", cls_name, true, false):
 			if not (node is Window):
 				continue
 			var w := node as Window
-			if w == main_win or not w.visible:
+			if w == main_win or not w.visible or _is_tooltip_window(w):
 				continue
-			if _is_tooltip_window(w):
-				continue
-			return true
-	# 2) exclusive 子弹窗（勿对嵌入子窗调 DisplayServer.window_*：macOS 会报 !windows.has）
-	for node in root.find_children("*", "Window", true, false):
-		if not (node is Window):
-			continue
-		var w2 := node as Window
-		if w2 == main_win or not w2.visible or _is_tooltip_window(w2):
-			continue
-		if w2.exclusive:
-			return true
-	# 3) 可见的 ColorPicker（懒创建，只有弹开才在树里可见）
-	for node in root.find_children("*", "ColorPicker", true, false):
-		if node is CanvasItem and (node as CanvasItem).is_visible_in_tree():
-			return true
+			if w is AcceptDialog or w is FileDialog:
+				return true
+			if w.exclusive:
+				return true
+			if slot_r.size.x < 1.0 or slot_r.size.y < 1.0:
+				return true
+			if _window_content_intersects_slot(w, slot_r):
+				return true
 	return false
+
+
+func _window_content_intersects_slot(w: Window, slot_r: Rect2) -> bool:
+	for ch in w.get_children():
+		if ch is Control:
+			var c := ch as Control
+			if c.is_visible_in_tree() and c.get_global_rect().intersects(slot_r):
+				return true
+	var wr := Rect2(Vector2(w.position), Vector2(w.size))
+	return wr.size.x >= 8.0 and wr.size.y >= 8.0 and wr.intersects(slot_r)
+
 
 func _is_tooltip_window(w: Window) -> bool:
 	var cls := w.get_class()
@@ -339,7 +349,10 @@ func _refresh_active_from_event(reason: String) -> void:
 		return
 	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
 		_overlay_suppressed_by_popup = true
-		if _vte.is_running():
+		# 仍拉起宿主，只是先 hide，避免永久黑槽
+		if not _vte.is_running() or not _term_placed:
+			_ensure_placed(false)
+		elif _vte.is_running():
 			_vte.hide()
 		return
 	if _term_placed and _vte.is_running():
@@ -489,17 +502,14 @@ func _apply_placed_geom() -> bool:
 func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 	## 铺 VTE 到当前槽位；默认不抢键盘（Alt+Tab / 几何同步只铺窗）。
 	## grab_focus：开启会话等主动操作才为 true。
+	## 有弹层时仍启动宿主，只是先 hide；避免误判导致永久黑槽。
 	if not _use_vte or _vte == null:
 		_set_status("无 VTE")
-		return
-	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
-		_overlay_suppressed_by_popup = true
-		if _vte.is_running():
-			_vte.hide()
 		return
 	if not _panel_slot_active():
 		_set_status("请先打开 Cursor Agent 页签/dock")
 		return
+	var blocked := _overlay_suppressed_by_popup or _editor_blocks_overlay()
 	await get_tree().process_frame
 	await get_tree().process_frame
 
@@ -518,11 +528,18 @@ func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 		_set_status("VTE 附着失败")
 		return
 
+	_term_placed = true
+	if blocked or _editor_blocks_overlay():
+		_overlay_suppressed_by_popup = true
+		_vte.hide()
+		_set_status("有编辑器弹层/正在运行 · 关闭后自动铺终端")
+		_dbg("G-PLACE", "deferred-by-popup", {})
+		return
+
 	if not _apply_placed_geom():
 		_set_status("槽位尺寸无效，请先拉大 dock 再试")
 		return
 
-	_term_placed = true
 	if not had_child or not _session_alive():
 		await _start_session_async(true, false)
 	await get_tree().process_frame
