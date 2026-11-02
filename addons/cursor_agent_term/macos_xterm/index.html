@@ -61,7 +61,28 @@
     fit.fit();
     term.writeln('\x1b[90mgcat macos term ready\x1b[0m');
 
-    term.onData(function (data) { post({ type: 'data', data: data }); });
+    var lastData = '';
+    var lastDataAt = 0;
+    term.onData(function (data) {
+      lastData = String(data);
+      lastDataAt = performance.now();
+      post({ type: 'data', data: data });
+    });
+    var ta = term.textarea;
+    if (ta) {
+      // keyCode 229：系统已用 input.insertText 提交（如 ？），xterm 在 _keyDownSeen 时丢掉。
+      // onData 没同步发出同一串时，补交系统原文，不改写字符。
+      ta.addEventListener('input', function (ev) {
+        if (ev.inputType === 'insertText' && ev.data) {
+          var text = String(ev.data);
+          if (!(lastData === text && performance.now() - lastDataAt < 40)) {
+            lastData = text;
+            lastDataAt = performance.now();
+            post({ type: 'data', data: text });
+          }
+        }
+      }, true);
+    }
     term.attachCustomKeyEventHandler(function (ev) {
       if (ev.type !== 'keydown') return true;
       const key = ev.key;
