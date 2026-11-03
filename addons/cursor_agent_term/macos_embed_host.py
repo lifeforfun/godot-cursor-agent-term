@@ -168,7 +168,8 @@ def main() -> None:
 			self._buf = b""
 			self._attached = False
 			self._visible = False
-			self._last_geom = None
+			self._last_geom = None  # (x,y,w,h) Godot 屏坐标调试用
+			self._last_rel = None  # (fx,fy,fw,fh) 或 None
 			self._child_pid = -1
 			self._master_fd = -1
 			self._pty_thread: threading.Thread | None = None
@@ -578,7 +579,7 @@ def main() -> None:
 			)
 			return rect, sw, sh
 
-		def show_at(self, x: int, y: int, w: int, h: int, rel=None) -> None:
+		def show_at(self, x: int, y: int, w: int, h: int, rel=None, notify_mapped: bool = True) -> None:
 			if not self._attached:
 				_dbg("H-GEOM", "skip-not-attached", x=x, y=y, w=w, h=h)
 				return
@@ -586,9 +587,12 @@ def main() -> None:
 				frame = None
 				cw = ch = 0.0
 				if rel is not None:
+					self._last_rel = (float(rel[0]), float(rel[1]), float(rel[2]), float(rel[3]))
 					got = self._frame_from_rel(rel[0], rel[1], rel[2], rel[3])
 					if got is not None:
 						frame, cw, ch = got
+				else:
+					self._last_rel = None
 				if frame is None:
 					w = max(1, int(w))
 					h = max(1, int(h))
@@ -621,8 +625,48 @@ def main() -> None:
 					web_ready=self._web_ready,
 					godot_front=self._godot_is_front(),
 				)
+				if first and notify_mapped:
+					# 与 Linux map-event 对齐：通知 Godot frame_post_draw 再抬一次
+					self._emit({"event": "mapped"})
 			except Exception as e:  # noqa: BLE001
 				_dbg("H-GEOM", "show-fail", err=str(e))
+
+		def remount(self) -> None:
+			"""软 orderOut → orderFront：Metal 合成后把 Floating 叠窗重新抬上。"""
+			if not self._attached or not self._want_visible:
+				return
+			try:
+				self.win.orderOut_(None)
+			except Exception:
+				pass
+			self._visible = False
+			rel = self._last_rel
+			g = self._last_geom
+			# notify_mapped=False：避免 remount→mapped→再 arm 死循环
+			if rel is not None:
+				x = y = 0
+				w = h = 0
+				if g is not None:
+					x, y, w, h = int(g[0]), int(g[1]), int(g[2]), int(g[3])
+				self.show_at(x, y, w or 800, h or 240, rel=rel, notify_mapped=False)
+			elif g is not None:
+				self.show_at(int(g[0]), int(g[1]), int(g[2]), int(g[3]), rel=None, notify_mapped=False)
+			else:
+				self._sync_front_app("remount")
+				self._js("window.gcatFit && window.gcatFit()")
+			_dbg("H-GEOM", "remount")
+
+		def refresh_paint(self) -> None:
+			"""不抢焦点，只 orderFront + xterm fit。"""
+			if not self._want_visible:
+				return
+			try:
+				if self._godot_is_front():
+					self.win.orderFront_(None)
+					self._visible = True
+			except Exception as e:  # noqa: BLE001
+				_dbg("H-PAINT", "fail", err=str(e))
+			self._js("window.gcatFit && window.gcatFit()")
 
 		def hide(self) -> None:
 			## 只藏窗，保留 _last_geom，便于弹层关闭后立刻按原几何 show
@@ -865,6 +909,10 @@ def main() -> None:
 					)
 				elif cmd == "hide":
 					self.hide()
+				elif cmd == "remount":
+					self.remount()
+				elif cmd == "refresh_paint":
+					self.refresh_paint()
 				elif cmd == "spawn":
 					self.spawn(list(msg.get("argv") or []), str(msg.get("cwd") or ""))
 				elif cmd == "write":

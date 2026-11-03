@@ -180,6 +180,15 @@ func hide() -> void:
 	_send({"cmd": "hide"})
 
 
+func remount() -> void:
+	## 与 Linux VTE 同契约：软藏再抬，应对 Godot Metal 合成盖住叠窗
+	_send({"cmd": "remount"})
+
+
+func refresh_paint() -> void:
+	_send({"cmd": "refresh_paint"})
+
+
 func focus() -> void:
 	_send({"cmd": "focus"})
 

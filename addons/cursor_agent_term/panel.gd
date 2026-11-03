@@ -26,6 +26,11 @@ var _geom_sync_queued: bool = false
 var _editor_ready_seen: bool = false
 ## 编辑器 Popup/对话框打开时隐藏浮层，避免挡住且看不见（全平台）
 var _overlay_suppressed_by_popup: bool = false
+## Godot 画完一帧后再抬叠窗（Vulkan/Metal 会盖住刚 map 的叠窗）；按帧预算，非固定毫秒
+var _restack_armed: bool = false
+var _restack_budget: int = 0
+var _restack_in_flight: bool = false  # remount 中忽略 mapped，防循环
+var _frame_hooked: bool = false
 
 
 func _ready() -> void:
@@ -71,6 +76,10 @@ func _dbg(tag: String, msg: String, extra: Dictionary = {}) -> void:
 
 
 func _exit_tree() -> void:
+	_disarm_restack()
+	if _frame_hooked and RenderingServer.frame_post_draw.is_connected(_on_frame_post_draw):
+		RenderingServer.frame_post_draw.disconnect(_on_frame_post_draw)
+	_frame_hooked = false
 	if _vte:
 		_vte.stop_host()
 
@@ -206,7 +215,14 @@ func _process(_delta: float) -> void:
 	## 轮询内嵌宿主 TCP；并缓存脚本选区（点按钮失焦前）
 	EditorCtxScript.refresh_cache()
 	if _use_vte and _vte:
-		_vte.poll_event()
+		# 排空本帧事件：mapped → 等 Godot frame_post_draw 再抬窗（跨平台）
+		while true:
+			var ev: Dictionary = _vte.poll_event()
+			if ev.is_empty():
+				break
+			var ename := str(ev.get("event", ""))
+			if ename == "mapped" and not _restack_in_flight:
+				_arm_restack("embed-mapped")
 		_update_popup_suppress()
 
 
@@ -233,6 +249,7 @@ func _update_popup_suppress() -> void:
 	# 启动时若一直被误判挡住，_term_placed 可能仍是 false，需补铺
 	if _term_placed and _vte.is_running():
 		_apply_placed_geom()
+		_arm_restack("popup-restore")
 	else:
 		_ensure_placed(false)
 
@@ -346,11 +363,66 @@ func _refresh_active_from_event(reason: String) -> void:
 		return
 	if _term_placed and _vte.is_running():
 		_apply_placed_geom()
+		_arm_restack("tab-back")
 		_set_status("已回到 Cursor Agent")
 	elif _session_alive() or _use_vte:
 		_ensure_placed(false)
 	else:
 		_set_status("开启会话后会自动铺终端")
+
+
+func _arm_restack(reason: String) -> void:
+	## 等 Godot frame_post_draw（Vulkan/Metal 画完）再 remount/raise。
+	## 契约：各平台 embed 桥需实现 remount / refresh_paint（Windows 落地时同样）。
+	if not _use_vte or _vte == null:
+		return
+	if not _vte.has_method("remount") and not _vte.has_method("refresh_paint"):
+		return
+	_restack_armed = true
+	# 第 1 帧 remount，第 2 帧再 raise（应对连续两帧合成）
+	_restack_budget = 2
+	_ensure_frame_hook()
+	_dbg("G-PLACE", "arm-restack", {"reason": reason, "budget": _restack_budget})
+
+
+func _disarm_restack() -> void:
+	_restack_armed = false
+	_restack_budget = 0
+	_restack_in_flight = false
+
+
+func _ensure_frame_hook() -> void:
+	if _frame_hooked:
+		return
+	if not RenderingServer.frame_post_draw.is_connected(_on_frame_post_draw):
+		RenderingServer.frame_post_draw.connect(_on_frame_post_draw)
+	_frame_hooked = true
+
+
+func _on_frame_post_draw() -> void:
+	if not _restack_armed or _restack_budget <= 0:
+		return
+	if not _use_vte or _vte == null or not _vte.is_running():
+		_disarm_restack()
+		return
+	if _overlay_suppressed_by_popup or _editor_blocks_overlay() or not _panel_slot_active():
+		_disarm_restack()
+		return
+	if not _apply_placed_geom():
+		_disarm_restack()
+		return
+	_restack_in_flight = true
+	# 首帧：unmap/map；次帧：只 raise+重绘（Linux raise / macOS orderFront）
+	if _restack_budget >= 2 and _vte.has_method("remount"):
+		_vte.remount()
+	elif _vte.has_method("refresh_paint"):
+		_vte.refresh_paint()
+	_restack_budget -= 1
+	_dbg("G-PLACE", "restack-frame", {"left": _restack_budget})
+	if _restack_budget <= 0:
+		_disarm_restack()
+	else:
+		_restack_in_flight = false
 
 
 func _schedule_geom_sync(reason: String) -> void:
@@ -533,8 +605,8 @@ func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 		await _start_session_async(true, false)
 	await get_tree().process_frame
 	_apply_placed_geom()
-	await get_tree().create_timer(0.1).timeout
-	_apply_placed_geom()
+	# 等 Godot 下一帧画完再抬叠窗（frame_post_draw），不用固定 sleep
+	_arm_restack("after-place")
 	if grab_focus:
 		_focus_vte()
 	_dbg("G-PLACE", "ok", {"restart": force_restart_host, "grab": grab_focus, "w": _last_geom.size.x, "h": _last_geom.size.y})

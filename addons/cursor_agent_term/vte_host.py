@@ -129,6 +129,7 @@ class Host:
 		self.win.connect("button-press-event", self._on_win_button)
 		self.win.connect("configure-event", self._on_configure)
 		self.win.connect("focus-out-event", self._on_focus_out)
+		self.win.connect("map-event", self._on_map)
 
 		self.term = Vte.Terminal()
 		self.term.set_can_focus(True)
@@ -160,6 +161,8 @@ class Host:
 		self._clamp_armed = False
 		self._xclip_proc: subprocess.Popen | None = None
 		self._paste_gen = 0
+		self._remounting = False  # remount 期间不发 mapped，避免 Godot 侧死循环
+
 	def _apply_font(self) -> None:
 		for desc in _FONT_CANDIDATES:
 			try:
@@ -591,6 +594,54 @@ class Host:
 			self._emit({"event": "warn", "message": f"transient: {e}"})
 		return False
 
+	def _refresh_paint(self) -> bool:
+		"""抬到父窗之上并强制 VTE 重绘。首次 map 常被 Godot Vulkan 盖住/未 expose。"""
+		try:
+			gdk_win = self.win.get_window()
+			if gdk_win is not None:
+				gdk_win.raise_()
+				if self._parent_xid > 0 and GdkX11 is not None:
+					display = self.win.get_display()
+					if isinstance(display, GdkX11.X11Display):
+						parent = GdkX11.X11Window.foreign_new_for_display(
+							display, self._parent_xid
+						)
+						if parent is not None:
+							gdk_win.restack(parent, True)
+			self.term.queue_draw()
+			self.win.queue_draw()
+		except Exception as e:  # noqa: BLE001
+			_dbg("H-PAINT", "fail", err=str(e))
+		return False
+
+	def remount(self) -> None:
+		"""软 hide 再 show：等同「点走再点回」，把叠窗重新 map 到 Vulkan 之上。"""
+		g = self._last_geom
+		if not self._attached or g[0] is None:
+			return
+		x, y, w, h = int(g[0]), int(g[1]), int(g[2]), int(g[3])
+		self._remounting = True
+		if self._visible:
+			try:
+				self.win.hide()
+			except Exception:
+				pass
+			self._visible = False
+			self._clamp_armed = False
+			# 保留 _last_geom，供紧接着的 show_at 使用
+		_dbg("H-GEOM", "remount", x=x, y=y, w=w, h=h)
+		try:
+			self.show_at(x, y, w, h)
+		finally:
+			self._remounting = False
+
+	def _on_map(self, _w, _e) -> bool:
+		## map 完成：通知 Godot 侧用 frame_post_draw 抬窗（不用固定毫秒）
+		GLib.idle_add(self._refresh_paint)
+		if not self._remounting:
+			self._emit({"event": "mapped"})
+		return False
+
 	def show_at(self, x: int, y: int, w: int, h: int) -> None:
 		"""严格按底栏槽位像素定位；不 present，避免 WM 改尺寸/抢焦点。"""
 		if not self._attached:
@@ -609,12 +660,11 @@ class Host:
 		if first:
 			self.win.show_all()
 			self._visible = True
-			# show 后再钉一次，抵消 map 时 WM/VTE 撑大
+			# map 后再钉一次几何；抬窗交给 map-event → Godot frame_post_draw
 			GLib.idle_add(self._apply_geom_only, x, y, w, h)
-			GLib.timeout_add(50, self._apply_geom_only, x, y, w, h)
-			GLib.timeout_add(200, self._apply_geom_only, x, y, w, h)
 			_dbg("H-GEOM", "show", x=x, y=y, w=w, h=h)
 		else:
+			GLib.idle_add(self._refresh_paint)
 			_dbg("H-GEOM", "move", x=x, y=y, w=w, h=h)
 
 	def _lock_size_hints(self, w: int, h: int) -> None:
@@ -752,12 +802,12 @@ class Host:
 			if ok:
 				self._child_pid = int(pid)
 				self._emit({"event": "spawned", "pid": self._child_pid})
-				# 不在 spawn 后自动抢焦点；由开会话 / 点击终端显式 focus
-				# TUI 启动常改行列，延迟再钉回槽位
+				# 不在 spawn 后自动抢焦点；TUI 改行列由 configure-event / idle reclamp
 				if self._visible and self._last_geom[0] is not None:
 					GLib.idle_add(self._reclamp_last)
-					GLib.timeout_add(80, self._reclamp_last)
-					GLib.timeout_add(250, self._reclamp_last)
+					GLib.idle_add(self._refresh_paint)
+					# 通知 Godot：子进程已起，下一帧再 restack
+					self._emit({"event": "mapped"})
 			else:
 				self._emit({"event": "error", "message": "spawn_sync failed"})
 		except Exception as e:  # noqa: BLE001
@@ -818,6 +868,10 @@ class Host:
 			self.show_at(msg.get("x", 0), msg.get("y", 0), msg.get("w", 800), msg.get("h", 240))
 		elif cmd == "hide":
 			self.hide()
+		elif cmd == "remount":
+			self.remount()
+		elif cmd == "refresh_paint":
+			self._refresh_paint()
 		elif cmd == "spawn":
 			self.spawn(list(msg.get("argv") or []), str(msg.get("cwd") or ""))
 		elif cmd == "write":

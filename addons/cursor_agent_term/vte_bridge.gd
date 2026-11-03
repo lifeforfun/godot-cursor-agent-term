@@ -149,6 +149,15 @@ func hide() -> void:
 	_send({"cmd": "hide"})
 
 
+func remount() -> void:
+	## 软 hide+show：首次铺在 Godot Vulkan 上时常黑窗，需 remap 一次
+	_send({"cmd": "remount"})
+
+
+func refresh_paint() -> void:
+	_send({"cmd": "refresh_paint"})
+
+
 func focus() -> void:
 	_send({"cmd": "focus"})
 
