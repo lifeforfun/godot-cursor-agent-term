@@ -632,8 +632,11 @@ def main() -> None:
 				_dbg("H-GEOM", "show-fail", err=str(e))
 
 		def remount(self) -> None:
-			"""软 orderOut → orderFront：Metal 合成后把 Floating 叠窗重新抬上。"""
+			"""软 orderOut → orderFront。Godot 不在前台时绝不操作（防切屏跳回）。"""
 			if not self._attached or not self._want_visible:
+				return
+			if not self._godot_is_front():
+				_dbg("H-GEOM", "remount-skip-not-front")
 				return
 			try:
 				self.win.orderOut_(None)
@@ -657,13 +660,15 @@ def main() -> None:
 			_dbg("H-GEOM", "remount")
 
 		def refresh_paint(self) -> None:
-			"""不抢焦点，只 orderFront + xterm fit。"""
+			"""仅 xterm fit；Godot 已在前台才 orderFront（禁止把编辑器从后台拉回）。"""
 			if not self._want_visible:
 				return
+			if not self._godot_is_front():
+				_dbg("H-PAINT", "skip-godot-not-front")
+				return
 			try:
-				if self._godot_is_front():
-					self.win.orderFront_(None)
-					self._visible = True
+				self.win.orderFront_(None)
+				self._visible = True
 			except Exception as e:  # noqa: BLE001
 				_dbg("H-PAINT", "fail", err=str(e))
 			self._js("window.gcatFit && window.gcatFit()")

@@ -26,7 +26,9 @@ var _geom_sync_queued: bool = false
 var _editor_ready_seen: bool = false
 ## 编辑器 Popup/对话框打开时隐藏浮层，避免挡住且看不见（全平台）
 var _overlay_suppressed_by_popup: bool = false
-## Godot 画完一帧后再抬叠窗（Vulkan/Metal 会盖住刚 map 的叠窗）；按帧预算，非固定毫秒
+## 切到其它应用：必须藏叠窗；raise/remount 会把 Godot 父窗一起拉回前台
+var _overlay_suppressed_by_app_blur: bool = false
+## Godot 画完一帧后再处理叠窗（仅编辑器聚焦时）；按帧预算，非固定毫秒
 var _restack_armed: bool = false
 var _restack_budget: int = 0
 var _restack_in_flight: bool = false  # remount 中忽略 mapped，防循环
@@ -82,6 +84,31 @@ func _exit_tree() -> void:
 	_frame_hooked = false
 	if _vte:
 		_vte.stop_host()
+
+
+func _notification(what: int) -> void:
+	## 切屏：立刻藏叠窗并取消 restack，禁止把编辑器拽回前台
+	if what == NOTIFICATION_APPLICATION_FOCUS_OUT:
+		_overlay_suppressed_by_app_blur = true
+		_disarm_restack()
+		if _use_vte and _vte != null and _vte.is_running():
+			_vte.hide()
+		_dbg("G-FOCUS", "out", {})
+	elif what == NOTIFICATION_APPLICATION_FOCUS_IN:
+		_overlay_suppressed_by_app_blur = false
+		_dbg("G-FOCUS", "in", {})
+		if _use_vte and _term_placed and _panel_slot_active() and not _overlay_suppressed_by_popup:
+			_apply_placed_geom()
+			_arm_restack("app-focus-in")
+
+
+func _editor_app_focused() -> bool:
+	if _overlay_suppressed_by_app_blur:
+		return false
+	var w := get_window()
+	if w == null:
+		return false
+	return DisplayServer.window_is_focused(w.get_window_id())
 
 
 func _build_ui() -> void:
@@ -372,14 +399,16 @@ func _refresh_active_from_event(reason: String) -> void:
 
 
 func _arm_restack(reason: String) -> void:
-	## 等 Godot frame_post_draw（Vulkan/Metal 画完）再 remount/raise。
-	## 契约：各平台 embed 桥需实现 remount / refresh_paint（Windows 落地时同样）。
+	## 仅编辑器聚焦时：frame_post_draw 后 remount 一次 + 再 refresh。
+	## 切到其它软件时禁止，否则 transient/orderFront 会把 Godot 拉回前台。
 	if not _use_vte or _vte == null:
+		return
+	if not _editor_app_focused():
+		_dbg("G-PLACE", "arm-skip-blur", {"reason": reason})
 		return
 	if not _vte.has_method("remount") and not _vte.has_method("refresh_paint"):
 		return
 	_restack_armed = true
-	# 第 1 帧 remount，第 2 帧再 raise（应对连续两帧合成）
 	_restack_budget = 2
 	_ensure_frame_hook()
 	_dbg("G-PLACE", "arm-restack", {"reason": reason, "budget": _restack_budget})
@@ -405,6 +434,12 @@ func _on_frame_post_draw() -> void:
 	if not _use_vte or _vte == null or not _vte.is_running():
 		_disarm_restack()
 		return
+	# 失焦：立刻停，绝不 remount/show
+	if not _editor_app_focused() or _overlay_suppressed_by_app_blur:
+		_disarm_restack()
+		if _vte.is_running():
+			_vte.hide()
+		return
 	if _overlay_suppressed_by_popup or _editor_blocks_overlay() or not _panel_slot_active():
 		_disarm_restack()
 		return
@@ -412,7 +447,7 @@ func _on_frame_post_draw() -> void:
 		_disarm_restack()
 		return
 	_restack_in_flight = true
-	# 首帧：unmap/map；次帧：只 raise+重绘（Linux raise / macOS orderFront）
+	# 首帧 remount（解决启动黑窗）；次帧只重绘。宿主内禁止 raise 父窗。
 	if _restack_budget >= 2 and _vte.has_method("remount"):
 		_vte.remount()
 	elif _vte.has_method("refresh_paint"):
@@ -532,7 +567,11 @@ func _slot_screen_rect() -> Rect2i:
 
 
 func _apply_placed_geom() -> bool:
-	# 现场再判一次：避免几何同步抢在 suppress 标志之前把叠窗又 show 出来
+	# 切到其它应用 / 弹层：禁止 show，否则会把 Godot 拽回前台
+	if _overlay_suppressed_by_app_blur or not _editor_app_focused():
+		if _vte != null and _vte.is_running():
+			_vte.hide()
+		return false
 	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
 		_overlay_suppressed_by_popup = true
 		if _vte != null and _vte.is_running():
@@ -563,14 +602,19 @@ func _apply_placed_geom() -> bool:
 func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 	## 铺 VTE 到当前槽位；默认不抢键盘（Alt+Tab / 几何同步只铺窗）。
 	## grab_focus：开启会话等主动操作才为 true。
-	## 有弹层时仍启动宿主，只是先 hide；避免误判导致永久黑槽。
+	## 有弹层 / 切到其它应用时仍可启宿主，但必须 hide，禁止 show 拽回 Godot。
 	if not _use_vte or _vte == null:
 		_set_status("无 VTE")
 		return
 	if not _panel_slot_active():
 		_set_status("请先打开 Cursor Agent 页签/dock")
 		return
-	var blocked := _overlay_suppressed_by_popup or _editor_blocks_overlay()
+	var blocked := (
+		_overlay_suppressed_by_popup
+		or _overlay_suppressed_by_app_blur
+		or not _editor_app_focused()
+		or _editor_blocks_overlay()
+	)
 	await get_tree().process_frame
 	await get_tree().process_frame
 
@@ -590,11 +634,12 @@ func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 		return
 
 	_term_placed = true
-	if blocked or _editor_blocks_overlay():
-		_overlay_suppressed_by_popup = true
+	if blocked or _editor_blocks_overlay() or not _editor_app_focused():
+		if _overlay_suppressed_by_popup or _editor_blocks_overlay():
+			_overlay_suppressed_by_popup = true
 		_vte.hide()
-		_set_status("有编辑器弹层/正在运行 · 关闭后自动铺终端")
-		_dbg("G-PLACE", "deferred-by-popup", {})
+		_set_status("有编辑器弹层/切屏/正在运行 · 回到编辑器后自动铺终端")
+		_dbg("G-PLACE", "deferred-hidden", {})
 		return
 
 	if not _apply_placed_geom():
@@ -604,10 +649,12 @@ func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 	if not had_child or not _session_alive():
 		await _start_session_async(true, false)
 	await get_tree().process_frame
+	if not _editor_app_focused():
+		_vte.hide()
+		return
 	_apply_placed_geom()
-	# 等 Godot 下一帧画完再抬叠窗（frame_post_draw），不用固定 sleep
 	_arm_restack("after-place")
-	if grab_focus:
+	if grab_focus and _editor_app_focused():
 		_focus_vte()
 	_dbg("G-PLACE", "ok", {"restart": force_restart_host, "grab": grab_focus, "w": _last_geom.size.x, "h": _last_geom.size.y})
 

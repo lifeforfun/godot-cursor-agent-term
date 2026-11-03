@@ -595,19 +595,10 @@ class Host:
 		return False
 
 	def _refresh_paint(self) -> bool:
-		"""抬到父窗之上并强制 VTE 重绘。首次 map 常被 Godot Vulkan 盖住/未 expose。"""
+		"""只重绘，禁止 raise/restack/present。
+		transient 子窗 raise 会把 Godot 父窗一起拉回前台（切屏又跳回编辑器）。
+		"""
 		try:
-			gdk_win = self.win.get_window()
-			if gdk_win is not None:
-				gdk_win.raise_()
-				if self._parent_xid > 0 and GdkX11 is not None:
-					display = self.win.get_display()
-					if isinstance(display, GdkX11.X11Display):
-						parent = GdkX11.X11Window.foreign_new_for_display(
-							display, self._parent_xid
-						)
-						if parent is not None:
-							gdk_win.restack(parent, True)
 			self.term.queue_draw()
 			self.win.queue_draw()
 		except Exception as e:  # noqa: BLE001
@@ -615,7 +606,7 @@ class Host:
 		return False
 
 	def remount(self) -> None:
-		"""软 hide 再 show：等同「点走再点回」，把叠窗重新 map 到 Vulkan 之上。"""
+		"""软 hide 再 show。仅应由 Godot 在「编辑器已聚焦」时调用；此处绝不抢焦点。"""
 		g = self._last_geom
 		if not self._attached or g[0] is None:
 			return
@@ -628,7 +619,6 @@ class Host:
 				pass
 			self._visible = False
 			self._clamp_armed = False
-			# 保留 _last_geom，供紧接着的 show_at 使用
 		_dbg("H-GEOM", "remount", x=x, y=y, w=w, h=h)
 		try:
 			self.show_at(x, y, w, h)
@@ -636,14 +626,14 @@ class Host:
 			self._remounting = False
 
 	def _on_map(self, _w, _e) -> bool:
-		## map 完成：通知 Godot 侧用 frame_post_draw 抬窗（不用固定毫秒）
+		## 只重绘；mapped 通知交 Godot（须已聚焦才 remount）
 		GLib.idle_add(self._refresh_paint)
 		if not self._remounting:
 			self._emit({"event": "mapped"})
 		return False
 
 	def show_at(self, x: int, y: int, w: int, h: int) -> None:
-		"""严格按底栏槽位像素定位；不 present，避免 WM 改尺寸/抢焦点。"""
+		"""严格按底栏槽位像素定位；不 present / 不 raise，避免 WM 拉起 Godot。"""
 		if not self._attached:
 			return
 		w = max(1, int(w))
@@ -660,8 +650,8 @@ class Host:
 		if first:
 			self.win.show_all()
 			self._visible = True
-			# map 后再钉一次几何；抬窗交给 map-event → Godot frame_post_draw
 			GLib.idle_add(self._apply_geom_only, x, y, w, h)
+			GLib.idle_add(self._refresh_paint)
 			_dbg("H-GEOM", "show", x=x, y=y, w=w, h=h)
 		else:
 			GLib.idle_add(self._refresh_paint)
