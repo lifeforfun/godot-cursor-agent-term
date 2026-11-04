@@ -87,12 +87,11 @@ func _exit_tree() -> void:
 
 
 func _notification(what: int) -> void:
-	## 切屏：立刻藏叠窗并取消 restack，禁止把编辑器拽回前台
+	## 失焦只停 restack。点终端时 Godot 必然失焦，这里 hide 会把叠窗打成黑槽。
+	## 切到其它 App 由 macOS 宿主看前台进程再藏。
 	if what == NOTIFICATION_APPLICATION_FOCUS_OUT:
 		_overlay_suppressed_by_app_blur = true
 		_disarm_restack()
-		if _use_vte and _vte != null and _vte.is_running():
-			_vte.hide()
 		_dbg("G-FOCUS", "out", {})
 	elif what == NOTIFICATION_APPLICATION_FOCUS_IN:
 		_overlay_suppressed_by_app_blur = false
@@ -189,8 +188,12 @@ func _focus_vte() -> void:
 
 func _on_slot_gui_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton and event.pressed:
-		if _use_vte and _vte and _vte.is_running() and _term_placed:
-			_focus_vte()
+		if _use_vte and _vte and _vte.is_running():
+			if _term_placed and _panel_slot_active():
+				_apply_placed_geom()
+				_focus_vte()
+			else:
+				_ensure_placed(false, true)
 			_dbg("G-PANEL", "slot-click-focus")
 
 
@@ -265,7 +268,7 @@ func _update_popup_suppress() -> void:
 			_overlay_suppressed_by_popup = true
 			_dbg("G-POPUP", "suppress")
 		if _vte.is_running():
-			_vte.hide()
+			_hide_overlay("popup")
 		return
 	if not _overlay_suppressed_by_popup:
 		return
@@ -275,7 +278,8 @@ func _update_popup_suppress() -> void:
 		return
 	# 启动时若一直被误判挡住，_term_placed 可能仍是 false，需补铺
 	if _term_placed and _vte.is_running():
-		_apply_placed_geom()
+		# 提示关掉时 Godot 往往仍是失焦（叠窗拿过键）。这里仍要铺回，否则槽位一直黑。
+		_apply_placed_geom(true)
 		_arm_restack("popup-restore")
 	else:
 		_ensure_placed(false)
@@ -287,6 +291,12 @@ func _editor_tree_root() -> Node:
 		return base.get_tree().root
 	var tree := get_tree()
 	return tree.root if tree != null else null
+
+
+func _hide_overlay(reason: String) -> void:
+	if _vte != null and _vte.is_running():
+		_vte.hide()
+	_dbg("G-HIDE", reason, {})
 
 
 func _editor_blocks_overlay() -> bool:
@@ -305,23 +315,35 @@ func _editor_blocks_overlay() -> bool:
 			if not (node is Window):
 				continue
 			var w := node as Window
-			if w == main_win or not w.visible or _is_tooltip_window(w):
+			if w == main_win or not w.visible:
+				continue
+			# 提示是独立窗，Floating 叠窗会盖住它。出现时先藏叠窗，关掉再铺回。
+			if _is_tooltip_window(w):
+				return true
+			# 终端已接焦（Godot 失焦）时，编辑器里冒出的 PopupMenu 不算要挡的弹层。
+			# 点下拉时 Godot 会先回到前台，blur 已清，仍会藏。
+			if _overlay_suppressed_by_app_blur and (w is PopupMenu or w is PopupPanel or w is Popup):
+				continue
+			if w.size.x < 8 or w.size.y < 8:
 				continue
 			return true
 	for node in root.find_children("*", "Window", true, false):
 		if not (node is Window):
 			continue
 		var w2 := node as Window
-		if w2 == main_win or not w2.visible or _is_tooltip_window(w2):
+		if w2 == main_win or not w2.visible:
 			continue
+		if _is_tooltip_window(w2):
+			return true
 		if w2.exclusive:
 			return true
 	return false
 
 
 func _is_tooltip_window(w: Window) -> bool:
+	## EditorHelpBitTooltip 不以 Tooltip 开头。
 	var cls := w.get_class()
-	return cls == "TooltipPanel" or cls.begins_with("Tooltip")
+	return cls == "TooltipPanel" or cls.begins_with("Tooltip") or cls.ends_with("Tooltip")
 
 
 func _on_visibility_changed() -> void:
@@ -349,7 +371,7 @@ func on_dock_layout_event(layout: int) -> void:
 
 func on_dock_closed() -> void:
 	if _use_vte and _vte and _vte.is_running():
-		_vte.hide()
+		_hide_overlay("dock-closed")
 	_was_panel_active = false
 	_dbg("G-EVT", "dock-closed", {})
 
@@ -371,13 +393,13 @@ func _refresh_active_from_event(reason: String) -> void:
 	var active := _panel_slot_active()
 	if active == _was_panel_active:
 		if not active and _vte.is_running():
-			_vte.hide()
+			_hide_overlay("tab-inactive")
 		return
 	_was_panel_active = active
 	_dbg("G-TAB", "changed", {"active": active, "placed": _term_placed, "reason": reason})
 	if not active:
 		if _vte.is_running():
-			_vte.hide()
+			_hide_overlay("tab-leave")
 		_set_status("已切到其它页签 · 终端已隐藏")
 		return
 	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
@@ -386,7 +408,7 @@ func _refresh_active_from_event(reason: String) -> void:
 		if not _vte.is_running() or not _term_placed:
 			_ensure_placed(false)
 		elif _vte.is_running():
-			_vte.hide()
+			_hide_overlay("tab-blocked")
 		return
 	if _term_placed and _vte.is_running():
 		_apply_placed_geom()
@@ -437,8 +459,6 @@ func _on_frame_post_draw() -> void:
 	# 失焦：立刻停，绝不 remount/show
 	if not _editor_app_focused() or _overlay_suppressed_by_app_blur:
 		_disarm_restack()
-		if _vte.is_running():
-			_vte.hide()
 		return
 	if _overlay_suppressed_by_popup or _editor_blocks_overlay() or not _panel_slot_active():
 		_disarm_restack()
@@ -487,8 +507,7 @@ func _sync_geom_if_changed(reason: String) -> void:
 	## 旧逻辑 sync 时 set_geom 绝对坐标，HiDPI 下会漂到槽位左边。
 	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
 		_overlay_suppressed_by_popup = true
-		if _vte != null and _vte.is_running():
-			_vte.hide()
+		_hide_overlay("geom-sync")
 		return
 	if not _term_placed or _vte == null or not _vte.is_running() or not _vte.is_attached():
 		return
@@ -526,7 +545,7 @@ func _bootstrap_session_and_place() -> void:
 				return
 		await get_tree().create_timer(0.08).timeout
 	if _use_vte and _vte and _vte.is_running() and not _term_placed:
-		_vte.hide()
+		_hide_overlay("bootstrap")
 	_set_status("打开 Cursor Agent 页签后自动铺终端")
 
 
@@ -566,16 +585,14 @@ func _slot_screen_rect() -> Rect2i:
 	return Rect2i()
 
 
-func _apply_placed_geom() -> bool:
-	# 切到其它应用 / 弹层：禁止 show，否则会把 Godot 拽回前台
-	if _overlay_suppressed_by_app_blur or not _editor_app_focused():
-		if _vte != null and _vte.is_running():
-			_vte.hide()
+func _apply_placed_geom(allow_blur: bool = false) -> bool:
+	# 切到其它应用 / 弹层：禁止 show，否则会把 Godot 拽回前台。
+	# allow_blur：提示/弹层刚关掉，叠窗自己拿过焦点，仍要把终端铺回去。
+	if not allow_blur and (_overlay_suppressed_by_app_blur or not _editor_app_focused()):
 		return false
 	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
 		_overlay_suppressed_by_popup = true
-		if _vte != null and _vte.is_running():
-			_vte.hide()
+		_hide_overlay("apply-geom")
 		return false
 	if _vte == null or not _vte.is_running() or not _vte.is_attached():
 		return false
@@ -602,19 +619,14 @@ func _apply_placed_geom() -> bool:
 func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 	## 铺 VTE 到当前槽位；默认不抢键盘（Alt+Tab / 几何同步只铺窗）。
 	## grab_focus：开启会话等主动操作才为 true。
-	## 有弹层 / 切到其它应用时仍可启宿主，但必须 hide，禁止 show 拽回 Godot。
+	## 有弹层时仍可启宿主，但必须 hide，避免误判成永久黑槽。
 	if not _use_vte or _vte == null:
 		_set_status("无 VTE")
 		return
 	if not _panel_slot_active():
 		_set_status("请先打开 Cursor Agent 页签/dock")
 		return
-	var blocked := (
-		_overlay_suppressed_by_popup
-		or _overlay_suppressed_by_app_blur
-		or not _editor_app_focused()
-		or _editor_blocks_overlay()
-	)
+	var blocked := _overlay_suppressed_by_popup or _editor_blocks_overlay()
 	await get_tree().process_frame
 	await get_tree().process_frame
 
@@ -634,12 +646,11 @@ func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 		return
 
 	_term_placed = true
-	if blocked or _editor_blocks_overlay() or not _editor_app_focused():
-		if _overlay_suppressed_by_popup or _editor_blocks_overlay():
-			_overlay_suppressed_by_popup = true
-		_vte.hide()
-		_set_status("有编辑器弹层/切屏/正在运行 · 回到编辑器后自动铺终端")
-		_dbg("G-PLACE", "deferred-hidden", {})
+	if blocked or _editor_blocks_overlay():
+		_overlay_suppressed_by_popup = true
+		_hide_overlay("ensure-placed")
+		_set_status("有编辑器弹层/正在运行 · 关闭后自动铺终端")
+		_dbg("G-PLACE", "deferred-by-popup", {})
 		return
 
 	if not _apply_placed_geom():
@@ -650,7 +661,6 @@ func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
 		await _start_session_async(true, false)
 	await get_tree().process_frame
 	if not _editor_app_focused():
-		_vte.hide()
 		return
 	_apply_placed_geom()
 	_arm_restack("after-place")
@@ -669,7 +679,7 @@ func _on_start_session() -> void:
 			await _ensure_placed(false, true)
 		else:
 			if _vte and _vte.is_running():
-				_vte.hide()
+				_hide_overlay("start-inactive")
 			_set_status("会话已开 · 回到本页签即自动铺终端")
 
 
@@ -734,7 +744,7 @@ func _start_session_async(resume: bool, force_new: bool) -> void:
 		elif _panel_slot_active():
 			await _ensure_placed(false, true)
 		else:
-			_vte.hide()
+			_hide_overlay("session-inactive")
 			_set_status("会话已开 · 回到本页签即铺终端")
 	elif force_new or not resume:
 		_on_open_terminal()

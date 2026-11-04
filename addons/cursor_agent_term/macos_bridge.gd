@@ -181,7 +181,7 @@ func hide() -> void:
 
 
 func remount() -> void:
-	## 与 Linux VTE 同契约：软藏再抬，应对 Godot Metal 合成盖住叠窗
+	## macOS 宿主只重绘抬层，不再 orderOut
 	_send({"cmd": "remount"})
 
 

@@ -326,16 +326,39 @@ def main() -> None:
 			_dbg("H-FOCUS", "resign")
 
 		def _apply_input_passthrough(self) -> None:
-			## 未接键时穿透鼠标，避免 Floating 叠窗挡住 Godot 下拉/选项弹层
+			## 叠窗显示时自己接鼠标。穿透会点到槽位下的 Godot，弹出 PopupMenu 后再被藏成黑槽。
+			## 真弹层打开时叠窗已让开，点击落到编辑器。
 			try:
-				self.win.setIgnoresMouseEvents_(not self._accept_keys)
+				self.win.setIgnoresMouseEvents_(False)
 			except Exception as e:  # noqa: BLE001
 				_dbg("H-FOCUS", "passthrough-fail", err=str(e))
 
+		def _unpark(self) -> None:
+			try:
+				from AppKit import NSFloatingWindowLevel
+
+				self.win.setLevel_(NSFloatingWindowLevel)
+				self.win.setAlphaValue_(1.0)
+				self.win.setIgnoresMouseEvents_(False)
+			except Exception:
+				pass
+
+		def _park(self) -> None:
+			## 不 orderOut。卸窗口会清掉 WKWebView，再抬回来是黑块，而且会重新挡住提示。
+			self._accept_keys = False
+			try:
+				self.win.setAlphaValue_(0.0)
+				self.win.setIgnoresMouseEvents_(True)
+				self.win.setLevel_(0)
+			except Exception:
+				pass
+			self._visible = False
+
 		def _sync_front_app(self, reason: str = "") -> None:
-			## 只 orderFront/Out，绝不 makeKey / activate（避免 show 时抢焦点）
+			## 只抬/让开，绝不 makeKey / activate（避免 show 时抢焦点）
 			should = bool(self._want_visible and self._godot_is_front())
 			if should:
+				self._unpark()
 				try:
 					self.win.orderFront_(None)
 				except Exception:
@@ -343,12 +366,7 @@ def main() -> None:
 				self._visible = True
 				self._apply_input_passthrough()
 			else:
-				self._accept_keys = False
-				try:
-					self.win.orderOut_(None)
-				except Exception:
-					pass
-				self._visible = False
+				self._park()
 			_dbg("H-APP", "sync", reason=reason, want=self._want_visible, show=should)
 
 		def _emit(self, obj: dict) -> None:
@@ -632,31 +650,13 @@ def main() -> None:
 				_dbg("H-GEOM", "show-fail", err=str(e))
 
 		def remount(self) -> None:
-			"""软 orderOut → orderFront。Godot 不在前台时绝不操作（防切屏跳回）。"""
+			"""只重绘抬层。orderOut 再 show 会把已经显示的 WKWebView 打成透明黑槽。"""
 			if not self._attached or not self._want_visible:
 				return
 			if not self._godot_is_front():
 				_dbg("H-GEOM", "remount-skip-not-front")
 				return
-			try:
-				self.win.orderOut_(None)
-			except Exception:
-				pass
-			self._visible = False
-			rel = self._last_rel
-			g = self._last_geom
-			# notify_mapped=False：避免 remount→mapped→再 arm 死循环
-			if rel is not None:
-				x = y = 0
-				w = h = 0
-				if g is not None:
-					x, y, w, h = int(g[0]), int(g[1]), int(g[2]), int(g[3])
-				self.show_at(x, y, w or 800, h or 240, rel=rel, notify_mapped=False)
-			elif g is not None:
-				self.show_at(int(g[0]), int(g[1]), int(g[2]), int(g[3]), rel=None, notify_mapped=False)
-			else:
-				self._sync_front_app("remount")
-				self._js("window.gcatFit && window.gcatFit()")
+			self.refresh_paint()
 			_dbg("H-GEOM", "remount")
 
 		def refresh_paint(self) -> None:
@@ -666,6 +666,7 @@ def main() -> None:
 			if not self._godot_is_front():
 				_dbg("H-PAINT", "skip-godot-not-front")
 				return
+			self._unpark()
 			try:
 				self.win.orderFront_(None)
 				self._visible = True
@@ -676,13 +677,7 @@ def main() -> None:
 		def hide(self) -> None:
 			## 只藏窗，保留 _last_geom，便于弹层关闭后立刻按原几何 show
 			self._want_visible = False
-			self._accept_keys = False
-			self._apply_input_passthrough()
-			try:
-				self.win.orderOut_(None)
-			except Exception:
-				pass
-			self._visible = False
+			self._park()
 			_dbg("H-GEOM", "hide")
 
 		def focus(self) -> None:
