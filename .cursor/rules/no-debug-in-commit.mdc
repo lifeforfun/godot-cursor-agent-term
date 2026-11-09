@@ -1,0 +1,14 @@
+---
+description: 提交前去掉调试代码（print/临时日志等）
+alwaysApply: true
+---
+
+# 提交前去掉调试代码
+
+`git commit` 前必须清掉本轮为排查而加的调试残留：
+
+- `print` / `push_warning` 调试输出（非产品必要）
+- 临时 `GCAT_DEBUG` 强制开关、硬编码日志路径
+- 仅用于定位的 TODO 探针、多余 `_dbg` 调用
+
+保留：既有的 `_dbg` / 环境变量门控日志机制；用户明确要求保留的输出除外。
