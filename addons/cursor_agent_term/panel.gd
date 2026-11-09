@@ -796,6 +796,10 @@ func _ensure_session() -> bool:
 	if _session_alive():
 		return true
 	await _start_session_async(true, false)
+	if not _session_alive():
+		return false
+	# 刚 spawn 时 agent TUI 未就绪，立刻写入会丢
+	await get_tree().create_timer(0.4).timeout
 	return _session_alive()
 
 
@@ -812,14 +816,17 @@ func _on_inject_path() -> void:
 	var notation: String = EditorCtxScript.collect_at_notation()
 	if notation.is_empty():
 		_set_status("请先打开脚本")
+		print("[cursor_agent_term] 注入失败：请先打开脚本")
 		return
 	if not await _ensure_session():
 		_set_status("会话未启动")
+		print("[cursor_agent_term] 注入失败：会话未启动，请先点「开启会话」")
 		return
+	# 前后空行保持 \n…\n。注入后不再 focus：叠窗抢键后第二次点按钮易没反应
 	var err: Error = _write_to_agent("\n" + notation + "\n")
-	if err == OK and _use_vte and _vte:
-		_focus_vte()
-	_set_status("已注入 %s" % notation if err == OK else "注入失败")
+	var msg := "已注入 %s" % notation if err == OK else "注入失败"
+	_set_status(msg)
+	print("[cursor_agent_term] ", msg)
 
 
 func _on_scroll_bottom() -> void:

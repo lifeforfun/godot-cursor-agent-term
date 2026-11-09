@@ -810,6 +810,7 @@ def main() -> None:
 
 		def write(self, data: str) -> None:
 			if not data or self._master_fd < 0:
+				_dbg("H-WRITE", "skip", has_data=bool(data), fd=self._master_fd)
 				return
 			b = data.encode("utf-8", errors="replace")
 			try:
