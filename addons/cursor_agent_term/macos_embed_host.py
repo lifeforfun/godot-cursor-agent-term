@@ -300,6 +300,46 @@ def main() -> None:
 			except Exception:
 				return True
 
+		def _activate_godot(self) -> bool:
+			## 把编辑器拉到钉钉等其它 App 前面。只 activate 宿主时 Godot 仍会被挡。
+			try:
+				from AppKit import NSApplicationActivateIgnoringOtherApps, NSWorkspace
+			except Exception:
+				return False
+			try:
+				opts = int(NSApplicationActivateIgnoringOtherApps)
+				try:
+					from AppKit import NSApplicationActivateAllWindows
+
+					opts |= int(NSApplicationActivateAllWindows)
+				except Exception:
+					pass
+				best = None
+				for app in NSWorkspace.sharedWorkspace().runningApplications():
+					if self._is_self_app(app):
+						continue
+					try:
+						if bool(app.isTerminated()):
+							continue
+					except Exception:
+						pass
+					name = str(app.localizedName() or "")
+					bid = str(app.bundleIdentifier() or "")
+					if not (("Godot" in name) or ("godot" in bid.lower())):
+						continue
+					best = app
+					# 优先编辑器进程
+					if ("Engine" in name) or ("godotengine" in bid.lower()) or bid.startswith("org.godotengine"):
+						break
+				if best is None:
+					return False
+				best.activateWithOptions_(opts)
+				_dbg("H-FOCUS", "activate-godot", name=str(best.localizedName() or ""), bid=str(best.bundleIdentifier() or ""))
+				return True
+			except Exception as e:  # noqa: BLE001
+				_dbg("H-FOCUS", "activate-godot-fail", err=str(e))
+				return False
+
 		def _install_click_focus(self) -> None:
 			## 对齐 vte button-press → _focus_term；不在 geom/spawn 里接键
 			try:
@@ -684,16 +724,18 @@ def main() -> None:
 			"""用户点终端 / 显式 focus：临时接键盘。对齐 vte_host._focus_term（2f9c951）。
 
 			- 不在 geom/spawn 调用；show 只用 orderFront
-			- 跨进程必须 activate 才能收键（≈ Linux gdk_win.focus），仅此处
-			- 失焦只清 _accept_keys，不 activate Godot / 不还焦点拉锯
+			- 先 activate Godot（越过钉钉等），再 activate 宿主收键
+			  若只 activate 宿主，编辑器仍可能被其它 App 挡住
+			- 失焦只清 _accept_keys，不在 resign 里再 activate 拉锯
 			"""
 			if not self._want_visible:
-				return
-			if not self._godot_is_front():
 				return
 			try:
 				self._accept_keys = True
 				self._apply_input_passthrough()
+				self._unpark()
+				# 顺序：Godot 压过钉钉 → 宿主接键（浮层在编辑器之上）
+				self._activate_godot()
 				self.app.activateIgnoringOtherApps_(True)
 				self.win.makeKeyAndOrderFront_(None)
 				try:
