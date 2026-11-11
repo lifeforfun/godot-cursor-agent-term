@@ -130,6 +130,8 @@ class Host:
 		self.win.connect("configure-event", self._on_configure)
 		self.win.connect("focus-out-event", self._on_focus_out)
 		self.win.connect("map-event", self._on_map)
+		self.win.connect("key-press-event", self._on_key_press)
+		self.win.add_events(Gdk.EventMask.KEY_PRESS_MASK)
 
 		self.term = Vte.Terminal()
 		self.term.set_can_focus(True)
@@ -162,6 +164,69 @@ class Host:
 		self._xclip_proc: subprocess.Popen | None = None
 		self._paste_gen = 0
 		self._remounting = False  # remount 期间不发 mapped，避免 Godot 侧死循环
+		self._xdisp = None  # lazy Xlib；Alt 让焦点时用
+
+	def _xdisplay(self):
+		if self._xdisp is not None:
+			return self._xdisp if self._xdisp is not False else None
+		try:
+			from Xlib import display as xdisplay
+
+			self._xdisp = xdisplay.Display()
+		except Exception:
+			self._xdisp = False
+		return self._xdisp if self._xdisp is not False else None
+
+	def _apply_skip_hints(self) -> None:
+		## remount/show 后 GTK 偶发丢掉 skip；Cinnamon Alt+Tab 用 !is_skip_taskbar() 过滤
+		try:
+			self.win.set_skip_taskbar_hint(True)
+			self.win.set_skip_pager_hint(True)
+			self.win.set_focus_on_map(False)
+		except Exception:
+			pass
+		d = self._xdisplay()
+		gdk_win = self.win.get_window()
+		if d is None or gdk_win is None or GdkX11 is None:
+			return
+		try:
+			xid = int(GdkX11.X11Window.get_xid(gdk_win))
+			root = d.screen().root
+			nw = d.get_atom("_NET_WM_STATE")
+			skip_tb = d.get_atom("_NET_WM_STATE_SKIP_TASKBAR")
+			skip_pg = d.get_atom("_NET_WM_STATE_SKIP_PAGER")
+			# _NET_WM_STATE：action=1 ADD，一次加两个 atom
+			from Xlib import X
+			from Xlib.protocol import event as xevent
+
+			ev = xevent.ClientMessage(
+				window=xid,
+				client_type=nw,
+				data=(32, [1, skip_tb, skip_pg, 0, 0]),
+			)
+			mask = X.SubstructureRedirectMask | X.SubstructureNotifyMask
+			root.send_event(ev, event_mask=mask)
+			d.flush()
+		except Exception as e:  # noqa: BLE001
+			_dbg("H-WM", "skip-hints-fail", err=str(e))
+
+	def _release_wm_focus(self) -> None:
+		## Alt(+Tab) 前放下本窗 WM 焦点。不 focus Godot：避免 FOCUS_IN→remount→map 打乱切换器。
+		try:
+			self.win.set_accept_focus(False)
+		except Exception:
+			pass
+		d = self._xdisplay()
+		if d is None:
+			return
+		try:
+			from Xlib import X
+
+			d.set_input_focus(X.PointerRoot, X.RevertToPointerRoot, X.CurrentTime)
+			d.flush()
+			_dbg("H-FOCUS", "release-for-alttab")
+		except Exception as e:  # noqa: BLE001
+			_dbg("H-FOCUS", "release-fail", err=str(e))
 
 	def _apply_font(self) -> None:
 		for desc in _FONT_CANDIDATES:
@@ -426,6 +491,7 @@ class Host:
 	def _focus_term(self) -> None:
 		"""用户点终端 / 显式 focus：临时允许接键盘。不 present、不抢 Godot。"""
 		try:
+			self._apply_skip_hints()
 			self.win.set_accept_focus(True)
 			gdk_win = self.win.get_window()
 			if gdk_win is not None:
@@ -466,6 +532,17 @@ class Host:
 		return True
 
 	def _on_key_press(self, _widget, event) -> bool:
+		# Alt/Meta 按下：先放下本窗焦点，让 Cinnamon Alt+Tab 从正常列表起算（勿 focus Godot）
+		if event.keyval in (
+			Gdk.KEY_Alt_L,
+			Gdk.KEY_Alt_R,
+			Gdk.KEY_Meta_L,
+			Gdk.KEY_Meta_R,
+			Gdk.KEY_Super_L,
+			Gdk.KEY_Super_R,
+		):
+			self._release_wm_focus()
+			return False
 		state = event.state & Gtk.accelerator_get_default_mod_mask()
 		ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
 		shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
@@ -627,6 +704,7 @@ class Host:
 
 	def _on_map(self, _w, _e) -> bool:
 		## 只重绘；mapped 通知交 Godot（须已聚焦才 remount）
+		self._apply_skip_hints()
 		GLib.idle_add(self._refresh_paint)
 		if not self._remounting:
 			self._emit({"event": "mapped"})
@@ -650,6 +728,7 @@ class Host:
 		if first:
 			self.win.show_all()
 			self._visible = True
+			self._apply_skip_hints()
 			GLib.idle_add(self._apply_geom_only, x, y, w, h)
 			GLib.idle_add(self._refresh_paint)
 			_dbg("H-GEOM", "show", x=x, y=y, w=w, h=h)
