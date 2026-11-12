@@ -1,11 +1,12 @@
 @tool
 class_name CursorAgentPlatLinux
 extends "res://addons/cursor_agent_term/plat_base.gd"
-## Linux：内嵌 VTE（vte_host.py）+ GNU screen 回退。
+## Linux：WebKitGTK + xterm_web/linux.html 内嵌 + GNU screen 回退。
 
 
-const VteBridgeScript := preload("res://addons/cursor_agent_term/vte_bridge.gd")
+const EmbedBridgeScript := preload("res://addons/cursor_agent_term/embed_bridge.gd")
 const ScreenHostScript := preload("res://addons/cursor_agent_term/screen_host.gd")
+const HOST_SCRIPT := "res://addons/cursor_agent_term/linux_embed_host.py"
 
 
 func os_id() -> String:
@@ -13,13 +14,13 @@ func os_id() -> String:
 
 
 func embed_ok() -> bool:
-	return VteBridgeScript.available()
+	return EmbedBridgeScript.linux_ok()
 
 
 func new_embed() -> RefCounted:
 	if not embed_ok():
 		return null
-	return VteBridgeScript.new()
+	return EmbedBridgeScript.new(HOST_SCRIPT, "python3")
 
 
 func fallback_ok() -> bool:
@@ -51,5 +52,5 @@ func hint() -> String:
 	if embed_ok():
 		return ""
 	if fallback_ok():
-		return "无 VTE：已用 screen 回退（可装 python3-gi / gir1.2-vte-2.91 启用内嵌）"
-	return "Linux 需 VTE（python3-gi+Vte）或 screen + 终端模拟器"
+		return "无 WebKitGTK：已用 screen 回退（可装 gir1.2-webkit2-4.1 启用内嵌 xterm）"
+	return "Linux 需 WebKitGTK（python3-gi + gir1.2-webkit2-4.1）或 screen + 终端模拟器"

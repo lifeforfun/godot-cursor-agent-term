@@ -5,12 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="stylesheet" href="xterm.css" />
 <style>
-  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #141414; color: #c66; font: 12px Menlo, monospace; }
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #141414; color: #c66; font: 12px monospace; }
   #term { width: 100%; height: 100%; background: #141414; overflow: hidden; }
   #err { display:none; padding: 8px; white-space: pre-wrap; }
   .xterm { width: 100% !important; height: 100% !important; padding: 0 !important; }
   .xterm-viewport { background-color: #141414 !important; }
-  /* 系统默认滚动条在深色底上是白条 */
   .xterm-viewport::-webkit-scrollbar { width: 6px; height: 6px; }
   .xterm-viewport::-webkit-scrollbar-track { background: #141414; }
   .xterm-viewport::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 3px; }
@@ -24,26 +23,27 @@
 <script src="addon-fit.js"></script>
 <script>
 (function () {
+  /** macOS 专用页：Cmd+C/V；IME insertText 补交（WKWebView keyCode 229 丢全角标点）。 */
   function post(msg) {
     try { window.webkit.messageHandlers.gcat.postMessage(msg); } catch (e) {}
   }
   function showErr(t) {
-    var el = document.getElementById('err');
-    el.style.display = 'block';
+    var el = document.getElementById("err");
+    el.style.display = "block";
     el.textContent = t;
-    post({ type: 'error', message: String(t) });
+    post({ type: "error", message: String(t) });
   }
   window.onerror = function (msg, src, line) {
-    showErr('JS: ' + msg + ' @' + src + ':' + line);
+    showErr("JS: " + msg + " @" + src + ":" + line);
   };
   try {
-    if (typeof Terminal === 'undefined') {
-      showErr('Terminal global missing (xterm.js not loaded)');
+    if (typeof Terminal === "undefined") {
+      showErr("Terminal global missing (xterm.js not loaded)");
       return;
     }
     var FitCtor = (window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon)) || null;
     if (!FitCtor) {
-      showErr('FitAddon missing');
+      showErr("FitAddon missing");
       return;
     }
     const term = new Terminal({
@@ -51,52 +51,56 @@
       cursorBlink: true,
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
       fontSize: Number(window.GCAT_FONT_SIZE || 10),
-      theme: { background: '#141414', foreground: '#d0d0d0' },
+      theme: { background: "#141414", foreground: "#d0d0d0" },
       scrollback: 10000,
       allowProposedApi: true,
     });
     const fit = new FitCtor();
     term.loadAddon(fit);
-    term.open(document.getElementById('term'));
+    term.open(document.getElementById("term"));
     fit.fit();
-    term.writeln('\x1b[90mgcat macos term ready\x1b[0m');
+    term.writeln("\x1b[90mgcat macos term ready\x1b[0m");
 
-    var lastData = '';
+    var lastData = "";
     var lastDataAt = 0;
     term.onData(function (data) {
       lastData = String(data);
       lastDataAt = performance.now();
-      post({ type: 'data', data: data });
+      post({ type: "data", data: data });
     });
     var ta = term.textarea;
     if (ta) {
       // keyCode 229：系统已用 input.insertText 提交（如 ？），xterm 在 _keyDownSeen 时丢掉。
-      // onData 没同步发出同一串时，补交系统原文，不改写字符。
-      ta.addEventListener('input', function (ev) {
-        if (ev.inputType === 'insertText' && ev.data) {
+      ta.addEventListener("input", function (ev) {
+        if (ev.inputType === "insertText" && ev.data) {
           var text = String(ev.data);
-          if (!(lastData === text && performance.now() - lastDataAt < 40)) {
+          if (!(lastData === text && performance.now() - lastDataAt < 80)) {
             lastData = text;
             lastDataAt = performance.now();
-            post({ type: 'data', data: text });
+            post({ type: "data", data: text });
           }
         }
       }, true);
     }
+
     term.attachCustomKeyEventHandler(function (ev) {
-      if (ev.type !== 'keydown') return true;
+      if (ev.type !== "keydown") return true;
       const key = ev.key;
-      // macOS：复制/粘贴用 Cmd；Ctrl+C 放行给 PTY（中断）。勿用 Linux 的 Ctrl+Shift+C。
-      if (ev.shiftKey && (key === 'Enter' || key === 'NumpadEnter')) {
-        post({ type: 'shift-enter' }); ev.preventDefault(); return false;
+      if (ev.shiftKey && (key === "Enter" || key === "NumpadEnter")) {
+        post({ type: "shift-enter" });
+        ev.preventDefault();
+        return false;
       }
-      if (ev.metaKey && !ev.ctrlKey && !ev.altKey && (key === 'c' || key === 'C')) {
-        const sel = term.getSelection();
-        if (sel) post({ type: 'copy', text: sel });
-        ev.preventDefault(); return false;
+      if (ev.metaKey && !ev.ctrlKey && !ev.altKey && (key === "c" || key === "C")) {
+        var sel = term.getSelection();
+        if (sel) post({ type: "copy", text: sel });
+        ev.preventDefault();
+        return false;
       }
-      if (ev.metaKey && !ev.ctrlKey && !ev.altKey && (key === 'v' || key === 'V')) {
-        post({ type: 'paste', shift: !!ev.shiftKey }); ev.preventDefault(); return false;
+      if (ev.metaKey && !ev.ctrlKey && !ev.altKey && (key === "v" || key === "V")) {
+        post({ type: "paste", shift: !!ev.shiftKey });
+        ev.preventDefault();
+        return false;
       }
       return true;
     });
@@ -105,24 +109,23 @@
       try {
         const bin = atob(b64);
         const arr = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
         term.write(arr);
-      } catch (e) { showErr('write: ' + e); }
+      } catch (e) { showErr("write: " + e); }
     };
     window.gcatFit = function () {
-      try { fit.fit(); post({ type: 'size', cols: term.cols, rows: term.rows }); } catch (e) {}
+      try { fit.fit(); post({ type: "size", cols: term.cols, rows: term.rows }); } catch (e) {}
     };
     window.gcatScrollBottom = function () { try { term.scrollToBottom(); } catch (e) {} };
     window.gcatFocus = function () { try { term.focus(); } catch (e) {} };
 
-    // 点终端 → 宿主临时接键（对齐 Linux 点击 _focus_term；geom/spawn 不自动 focus）
-    document.getElementById('term').addEventListener('mousedown', function () {
+    document.getElementById("term").addEventListener("mousedown", function () {
       try { term.focus(); } catch (e) {}
-      post({ type: 'focus-req' });
+      post({ type: "focus-req" });
     });
 
-    window.addEventListener('resize', function () { window.gcatFit(); });
-    setTimeout(function () { window.gcatFit(); post({ type: 'ready' }); }, 40);
+    window.addEventListener("resize", function () { window.gcatFit(); });
+    setTimeout(function () { window.gcatFit(); post({ type: "ready" }); }, 40);
   } catch (e) {
     showErr(e && e.stack ? e.stack : String(e));
   }

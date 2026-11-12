@@ -1,6 +1,6 @@
 @tool
 extends Control
-## Dock 内槽位 + VTE 浮层：自动铺开、跟尺寸/页签/dock；工具栏仅会话相关。
+## Dock 槽位 + xterm 叠窗：会话 / 注入路径 / 跟 dock；弹层与失焦时藏叠窗。
 
 const SessionStoreScript := preload("res://addons/cursor_agent_term/session_store.gd")
 const LauncherScript := preload("res://addons/cursor_agent_term/launcher.gd")
@@ -11,120 +11,99 @@ const GEOM_EPS_PX := 3
 var _plat
 var _store
 var _screen
-var _vte
-var _use_vte: bool = false
-var _status: Label
+var _embed
+var _use_embed: bool = false
 var _slot: ColorRect
 var _bound_session_id: String = ""
 var _session_started_at_ms: int = 0
 var _auto_started: bool = false
 var _last_geom: Rect2i = Rect2i()
-## 已铺过浮层后，尺寸/dock 变化会自动跟
 var _term_placed: bool = false
 var _was_panel_active: bool = false
 var _geom_sync_queued: bool = false
 var _editor_ready_seen: bool = false
-## 编辑器 Popup/对话框打开时隐藏浮层，避免挡住且看不见（全平台）
-var _overlay_suppressed_by_popup: bool = false
-## 切到其它应用：必须藏叠窗；raise/remount 会把 Godot 父窗一起拉回前台
-var _overlay_suppressed_by_app_blur: bool = false
-## Godot 画完一帧后再处理叠窗（仅编辑器聚焦时）；按帧预算，非固定毫秒
-var _restack_armed: bool = false
-var _restack_budget: int = 0
-var _restack_in_flight: bool = false  # remount 中忽略 mapped，防循环
-var _frame_hooked: bool = false
+var _suppress_popup: bool = false
+var _suppress_blur: bool = false
+var _first_remount_done: bool = false
+var _place_busy: bool = false
+const _DBG_PATH := "/tmp/gcat_linux_debug.log"
+
+
+func _dbg(tag: String, msg: String, extra: Dictionary = {}) -> void:
+	## 与宿主同文件，黑窗联调
+	var f := FileAccess.open(_DBG_PATH, FileAccess.READ_WRITE)
+	if f == null:
+		f = FileAccess.open(_DBG_PATH, FileAccess.WRITE)
+	if f == null:
+		return
+	f.seek_end()
+	var row := {"t": Time.get_time_string_from_system(), "tag": tag, "msg": msg}
+	for k in extra.keys():
+		row[k] = extra[k]
+	f.store_line(JSON.stringify(row))
+	f.close()
 
 
 func _ready() -> void:
 	_plat = PlatScript.get_plat()
 	_store = SessionStoreScript.new()
-	# 内嵌 / 回退全部由 plat 工厂创建，panel 不写 OS 分支
 	if _plat.embed_ok():
-		_vte = _plat.new_embed()
-		_use_vte = _vte != null
+		_embed = _plat.new_embed()
+		_use_embed = _embed != null
 	_screen = _plat.new_fallback()
 	_build_ui()
 	set_process(true)
 	set_process_input(true)
-	visibility_changed.connect(_on_visibility_changed)
-	# 面板自身尺寸变化（拆分条拖动 dock 大小）
-	resized.connect(func() -> void: on_dock_geom_event("panel-resized"))
-	item_rect_changed.connect(func() -> void: on_dock_geom_event("panel-rect"))
-	_dbg("G-PANEL", "ready", {"os": _plat.os_id(), "vte": _use_vte})
-	var ph: String = str(_plat.hint())
-	if not _use_vte and not ph.is_empty():
-		_set_status(ph)
-	# 会话预热；真正铺终端等 on_editor_ready / 显隐事件
-
-
-func _dbg(tag: String, msg: String, extra: Dictionary = {}) -> void:
-	## 默认关闭；export GCAT_DEBUG=1 时写入系统临时目录
-	if OS.get_environment("GCAT_DEBUG").strip_edges().is_empty():
-		return
-	var d := {"t": Time.get_time_string_from_system(), "tag": tag, "msg": msg}
-	for k in extra:
-		d[k] = extra[k]
-	var path := OS.get_temp_dir().path_join(
-		"gcat_macos_debug.log" if OS.get_name() == "macOS" else "gcat_vte_debug.log"
-	)
-	var f := FileAccess.open(path, FileAccess.READ_WRITE)
-	if f == null:
-		f = FileAccess.open(path, FileAccess.WRITE)
-	if f == null:
-		return
-	f.seek_end()
-	f.store_line(JSON.stringify(d))
-	f.flush()
+	visibility_changed.connect(func() -> void: _refresh_active("panel-vis"))
 
 
 func _exit_tree() -> void:
-	_disarm_restack()
-	if _frame_hooked and RenderingServer.frame_post_draw.is_connected(_on_frame_post_draw):
-		RenderingServer.frame_post_draw.disconnect(_on_frame_post_draw)
-	_frame_hooked = false
-	if _vte:
-		_vte.stop_host()
+	if _use_embed and _embed:
+		_embed.stop_host()
 
 
 func _notification(what: int) -> void:
-	## 失焦只停 restack。点终端时 Godot 必然失焦，这里 hide 会把叠窗打成黑槽。
-	## 切到其它 App 由 macOS 宿主看前台进程再藏。
 	if what == NOTIFICATION_APPLICATION_FOCUS_OUT:
-		_overlay_suppressed_by_app_blur = true
-		_disarm_restack()
+		## 点终端叠窗也会 FOCUS_OUT；勿在此 hide（日志里 app-blur 会立刻黑槽）。
+		## 切到其它 App 由宿主 _poll_front 自己 park。
+		_suppress_blur = true
 		_dbg("G-FOCUS", "out", {})
 	elif what == NOTIFICATION_APPLICATION_FOCUS_IN:
-		_overlay_suppressed_by_app_blur = false
+		_suppress_blur = false
 		_dbg("G-FOCUS", "in", {})
-		if _use_vte and _term_placed and _panel_slot_active() and not _overlay_suppressed_by_popup:
-			_apply_placed_geom()
-			_arm_restack("app-focus-in")
+		_restore_overlay("focus-in")
 
 
-func _editor_app_focused() -> bool:
-	if _overlay_suppressed_by_app_blur:
-		return false
-	var w := get_window()
-	if w == null:
-		return false
-	return DisplayServer.window_is_focused(w.get_window_id())
+func _editor_focused() -> bool:
+	return not _suppress_blur
+
+
+func _restore_overlay(reason: String) -> void:
+	## FOCUS_IN / 弹层关闭后强制铺回（_refresh_active 在 active 未变时会直接 return）
+	if not _use_embed or _embed == null:
+		return
+	if not _panel_slot_active():
+		return
+	if _suppress_popup or _editor_blocks_overlay():
+		_suppress_popup = true
+		_dbg("G-PLACE", "restore-blocked", {"reason": reason})
+		return
+	_dbg("G-PLACE", "restore", {"reason": reason, "placed": _term_placed, "running": _embed.is_running()})
+	if not _embed.is_running() or not _term_placed:
+		_ensure_placed(true)
+		return
+	_apply_geom(true)
+	if _embed.has_method("refresh_paint"):
+		_embed.refresh_paint()
 
 
 func _build_ui() -> void:
-	# 自身铺满 dock；工具栏贴底，上方高度全给终端槽位
-	set_anchors_and_offsets_preset(PRESET_FULL_RECT)
-	size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	size_flags_vertical = Control.SIZE_EXPAND_FILL
-
 	var root := VBoxContainer.new()
 	root.set_anchors_and_offsets_preset(PRESET_FULL_RECT)
 	root.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	root.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	root.add_theme_constant_override("separation", 2)
 	add_child(root)
-
-	# 状态只打日志，不占 UI 行
-	_status = null
 
 	_slot = ColorRect.new()
 	_slot.color = Color(0.08, 0.08, 0.08, 1)
@@ -145,7 +124,7 @@ func _build_ui() -> void:
 	_add_btn(bar, "开启会话", Callable(self, "_on_start_session"))
 	_add_btn(bar, "注入路径", Callable(self, "_on_inject_path"))
 	_add_btn(bar, "滚到底部", Callable(self, "_on_scroll_bottom"))
-	if not _use_vte:
+	if not _use_embed:
 		_add_btn(bar, "打开终端", Callable(self, "_on_open_terminal"))
 
 
@@ -153,13 +132,9 @@ func _add_btn(parent: Node, text: String, cb: Callable) -> void:
 	var b := Button.new()
 	b.text = text
 	b.focus_mode = Control.FOCUS_NONE
-	b.flat = false
 	b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	b.custom_minimum_size = Vector2(0, 26)
-	b.add_theme_constant_override("h_separation", 4)
 	b.add_theme_font_size_override("font_size", 13)
-	# 深色 dock 里默认按钮边容易糊掉，显式描边
 	b.add_theme_stylebox_override("normal", _btn_style(Color(0.16, 0.16, 0.16, 1), Color(0.55, 0.55, 0.55, 1)))
 	b.add_theme_stylebox_override("hover", _btn_style(Color(0.22, 0.22, 0.22, 1), Color(0.72, 0.72, 0.72, 1)))
 	b.add_theme_stylebox_override("pressed", _btn_style(Color(0.12, 0.12, 0.12, 1), Color(0.85, 0.85, 0.85, 1)))
@@ -180,109 +155,36 @@ func _btn_style(bg: Color, border: Color) -> StyleBoxFlat:
 	return sb
 
 
-func _focus_vte() -> void:
-	if not _use_vte or _vte == null:
-		return
-	_vte.focus()
-
-
-func _on_slot_gui_input(event: InputEvent) -> void:
-	if event is InputEventMouseButton and event.pressed:
-		if _use_vte and _vte and _vte.is_running():
-			if _term_placed and _panel_slot_active():
-				_apply_placed_geom()
-				_focus_vte()
-			else:
-				_ensure_placed(false, true)
-			_dbg("G-PANEL", "slot-click-focus")
-
-
-func _input(event: InputEvent) -> void:
-	## VTE 路径：Ctrl+V 只由 vte_host 在终端持焦时处理。
-	## 这里若再全局拦截，会把脚本编辑器里的粘贴偷进终端。
-	if _use_vte:
-		return
-	if not visible or not is_visible_in_tree():
-		return
-	if not _panel_slot_active():
-		return
-	if not (event is InputEventKey and event.pressed and not event.echo):
-		return
-	var k := event as InputEventKey
-	if k.keycode != KEY_V and k.physical_keycode != KEY_V:
-		return
-	if not k.ctrl_pressed:
-		return
-	if not _session_alive():
-		return
-	# screen 回退：仅本页签激活时把剪贴板打进会话
-	var text := DisplayServer.clipboard_get()
-	if text.is_empty():
-		return
-	var e2: Error = _write_to_agent(text.replace("\n", "\r"))
-	_dbg("G-PASTE", "screen-text", {"err": e2, "n": text.length()})
-	if e2 == OK:
-		get_viewport().set_input_as_handled()
-		_set_status("已粘贴文本")
-
-
-func _project_path() -> String:
-	return LauncherScript.project_root()
-
-
-func _session_name() -> String:
-	return LauncherScript.screen_session_name(_project_path())
-
-
-func _set_status(t: String) -> void:
-	## 不再占行；需要时只写调试日志
-	if t.is_empty():
-		return
-	_dbg("G-STATUS", t, {})
-
-
 func _process(_delta: float) -> void:
-	## 轮询内嵌宿主 TCP；并缓存脚本选区（点按钮失焦前）
 	EditorCtxScript.refresh_cache()
-	if _use_vte and _vte:
-		# 排空本帧事件：mapped → 等 Godot frame_post_draw 再抬窗（跨平台）
+	if _use_embed and _embed:
 		while true:
-			var ev: Dictionary = _vte.poll_event()
+			var ev: Dictionary = _embed.poll_event()
 			if ev.is_empty():
 				break
-			var ename := str(ev.get("event", ""))
-			if ename == "mapped" and not _restack_in_flight:
-				_arm_restack("embed-mapped")
+			# mapped 只作提示；不再连环 remount
 		_update_popup_suppress()
 
 
 func _update_popup_suppress() -> void:
-	## 有可见临时 UI 时藏浮层；关掉后若本页签仍在再铺回
-	if not _use_vte or _vte == null:
-		if _overlay_suppressed_by_popup:
-			_overlay_suppressed_by_popup = false
+	if not _use_embed or _embed == null:
+		_suppress_popup = false
 		return
-	var block := _editor_blocks_overlay()
+	var info := _editor_block_info()
+	var block := not info.is_empty()
 	if block:
-		if not _overlay_suppressed_by_popup:
-			_overlay_suppressed_by_popup = true
-			_dbg("G-POPUP", "suppress")
-		if _vte.is_running():
-			_hide_overlay("popup")
+		if not _suppress_popup:
+			_suppress_popup = true
+			_dbg("G-POPUP", "suppress", info)
+			if _embed.is_running():
+				_embed.hide()
+				_dbg("G-HIDE", "popup", info)
 		return
-	if not _overlay_suppressed_by_popup:
+	if not _suppress_popup:
 		return
-	_overlay_suppressed_by_popup = false
-	_dbg("G-POPUP", "restore")
-	if not _panel_slot_active():
-		return
-	# 启动时若一直被误判挡住，_term_placed 可能仍是 false，需补铺
-	if _term_placed and _vte.is_running():
-		# 提示关掉时 Godot 往往仍是失焦（叠窗拿过键）。这里仍要铺回，否则槽位一直黑。
-		_apply_placed_geom(true)
-		_arm_restack("popup-restore")
-	else:
-		_ensure_placed(false)
+	_suppress_popup = false
+	_dbg("G-POPUP", "restore", {})
+	_restore_overlay("popup-restore")
 
 
 func _editor_tree_root() -> Node:
@@ -293,195 +195,108 @@ func _editor_tree_root() -> Node:
 	return tree.root if tree != null else null
 
 
-func _hide_overlay(reason: String) -> void:
-	if _vte != null and _vte.is_running():
-		_vte.hide()
-	_dbg("G-HIDE", reason, {})
-
-
 func _editor_blocks_overlay() -> bool:
-	## 运行项目：游戏窗让路。
-	## 任意可见 Popup*/Dialog/exclusive：macOS Floating 叠窗会盖住嵌入弹层，必须整窗 hide。
-	## 不做「与槽位相交」判断（坐标系易漏，如下拉菜单被挡）。
-	## 宿主仍可在 suppress 时启动（见 _ensure_placed），避免黑槽。
+	return not _editor_block_info().is_empty()
+
+
+func _editor_block_info() -> Dictionary:
+	## 返回挡层信息；空=不挡。去掉「任意 exclusive Window」扫射（Godot 4.7 会误判成永久黑槽）。
 	if EditorInterface.is_playing_scene():
-		return true
+		return {"kind": "playing"}
 	var root := _editor_tree_root()
 	if root == null:
-		return false
+		return {}
 	var main_win: Window = get_window()
-	for cls_name in ["PopupPanel", "PopupMenu", "Popup", "AcceptDialog", "ConfirmationDialog", "FileDialog"]:
+	for cls_name in ["PopupMenu", "PopupPanel", "Popup", "AcceptDialog", "ConfirmationDialog", "FileDialog"]:
 		for node in root.find_children("*", cls_name, true, false):
 			if not (node is Window):
 				continue
 			var w := node as Window
 			if w == main_win or not w.visible:
 				continue
-			# 提示是独立窗，Floating 叠窗会盖住它。出现时先藏叠窗，关掉再铺回。
 			if _is_tooltip_window(w):
-				return true
-			# 终端已接焦（Godot 失焦）时，编辑器里冒出的 PopupMenu 不算要挡的弹层。
-			# 点下拉时 Godot 会先回到前台，blur 已清，仍会藏。
-			if _overlay_suppressed_by_app_blur and (w is PopupMenu or w is PopupPanel or w is Popup):
+				# Tooltip/EditorHelpBitTooltip 常挂 visible，勿当弹层（会永久 G-HIDE→黑槽）
+				continue
+			if _suppress_blur and (w is PopupMenu or w is PopupPanel or w is Popup):
 				continue
 			if w.size.x < 8 or w.size.y < 8:
 				continue
-			return true
-	for node in root.find_children("*", "Window", true, false):
-		if not (node is Window):
-			continue
-		var w2 := node as Window
-		if w2 == main_win or not w2.visible:
-			continue
-		if _is_tooltip_window(w2):
-			return true
-		if w2.exclusive:
-			return true
-	return false
+			return _win_info(w, cls_name)
+	return {}
+
+
+func _win_info(w: Window, kind: String) -> Dictionary:
+	return {
+		"kind": kind,
+		"cls": w.get_class(),
+		"name": str(w.name),
+		"w": int(w.size.x),
+		"h": int(w.size.y),
+		"exclusive": bool(w.exclusive),
+	}
 
 
 func _is_tooltip_window(w: Window) -> bool:
-	## EditorHelpBitTooltip 不以 Tooltip 开头。
 	var cls := w.get_class()
 	return cls == "TooltipPanel" or cls.begins_with("Tooltip") or cls.ends_with("Tooltip")
 
 
-func _on_visibility_changed() -> void:
-	_refresh_active_from_event("panel-vis")
-
-
 func on_editor_ready() -> void:
-	## 插件进入树 / 编辑器恢复 layout 后
-	_dbg("G-EVT", "editor-ready", {"seen": _editor_ready_seen})
 	_editor_ready_seen = true
-	await _bootstrap_session_and_place()
+	await _bootstrap()
 
 
 func on_dock_geom_event(reason: String) -> void:
-	## dock/面板/槽位 resized、挪槽位后的矩形变化
-	_dbg("G-EVT", "geom", {"reason": reason})
 	_schedule_geom_sync(reason)
 
 
-func on_dock_layout_event(layout: int) -> void:
-	## 竖/横/浮动布局切换（_update_layout）
-	_dbg("G-EVT", "layout", {"layout": layout})
-	_schedule_geom_sync("layout=%d" % layout)
+func on_dock_layout_event(_layout: int) -> void:
+	_schedule_geom_sync("layout")
 
 
 func on_dock_closed() -> void:
-	if _use_vte and _vte and _vte.is_running():
-		_hide_overlay("dock-closed")
+	if _use_embed and _embed and _embed.is_running():
+		_embed.hide()
 	_was_panel_active = false
-	_dbg("G-EVT", "dock-closed", {})
 
 
 func on_dock_opened() -> void:
-	_dbg("G-EVT", "dock-opened", {"placed": _term_placed})
-	_refresh_active_from_event("dock-opened")
+	_refresh_active("dock-opened")
 	_schedule_geom_sync("dock-opened")
 
 
 func on_dock_visibility_ping() -> void:
-	## 与 Inspector 等同槽切页签
-	_refresh_active_from_event("dock-vis")
+	_refresh_active("dock-vis")
 
 
-func _refresh_active_from_event(reason: String) -> void:
-	if not _use_vte or _vte == null:
+func _refresh_active(reason: String) -> void:
+	if not _use_embed or _embed == null:
 		return
 	var active := _panel_slot_active()
 	if active == _was_panel_active:
-		if not active and _vte.is_running():
-			_hide_overlay("tab-inactive")
+		if not active and _embed.is_running():
+			_embed.hide()
 		return
 	_was_panel_active = active
-	_dbg("G-TAB", "changed", {"active": active, "placed": _term_placed, "reason": reason})
 	if not active:
-		if _vte.is_running():
-			_hide_overlay("tab-leave")
-		_set_status("已切到其它页签 · 终端已隐藏")
+		if _embed.is_running():
+			_embed.hide()
 		return
-	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
-		_overlay_suppressed_by_popup = true
-		# 仍拉起宿主，只是先 hide，避免永久黑槽
-		if not _vte.is_running() or not _term_placed:
+	if _suppress_popup or _editor_blocks_overlay():
+		_suppress_popup = true
+		if not _embed.is_running() or not _term_placed:
 			_ensure_placed(false)
-		elif _vte.is_running():
-			_hide_overlay("tab-blocked")
+		elif _embed.is_running():
+			_embed.hide()
 		return
-	if _term_placed and _vte.is_running():
-		_apply_placed_geom()
-		_arm_restack("tab-back")
-		_set_status("已回到 Cursor Agent")
-	elif _session_alive() or _use_vte:
+	if _term_placed and _embed.is_running():
+		_apply_geom()
+		_maybe_first_remount()
+	else:
 		_ensure_placed(false)
-	else:
-		_set_status("开启会话后会自动铺终端")
-
-
-func _arm_restack(reason: String) -> void:
-	## 仅编辑器聚焦时：frame_post_draw 后 remount 一次 + 再 refresh。
-	## 切到其它软件时禁止，否则 transient/orderFront 会把 Godot 拉回前台。
-	if not _use_vte or _vte == null:
-		return
-	if not _editor_app_focused():
-		_dbg("G-PLACE", "arm-skip-blur", {"reason": reason})
-		return
-	if not _vte.has_method("remount") and not _vte.has_method("refresh_paint"):
-		return
-	_restack_armed = true
-	_restack_budget = 2
-	_ensure_frame_hook()
-	_dbg("G-PLACE", "arm-restack", {"reason": reason, "budget": _restack_budget})
-
-
-func _disarm_restack() -> void:
-	_restack_armed = false
-	_restack_budget = 0
-	_restack_in_flight = false
-
-
-func _ensure_frame_hook() -> void:
-	if _frame_hooked:
-		return
-	if not RenderingServer.frame_post_draw.is_connected(_on_frame_post_draw):
-		RenderingServer.frame_post_draw.connect(_on_frame_post_draw)
-	_frame_hooked = true
-
-
-func _on_frame_post_draw() -> void:
-	if not _restack_armed or _restack_budget <= 0:
-		return
-	if not _use_vte or _vte == null or not _vte.is_running():
-		_disarm_restack()
-		return
-	# 失焦：立刻停，绝不 remount/show
-	if not _editor_app_focused() or _overlay_suppressed_by_app_blur:
-		_disarm_restack()
-		return
-	if _overlay_suppressed_by_popup or _editor_blocks_overlay() or not _panel_slot_active():
-		_disarm_restack()
-		return
-	if not _apply_placed_geom():
-		_disarm_restack()
-		return
-	_restack_in_flight = true
-	# 首帧 remount（解决启动黑窗）；次帧只重绘。宿主内禁止 raise 父窗。
-	if _restack_budget >= 2 and _vte.has_method("remount"):
-		_vte.remount()
-	elif _vte.has_method("refresh_paint"):
-		_vte.refresh_paint()
-	_restack_budget -= 1
-	_dbg("G-PLACE", "restack-frame", {"left": _restack_budget})
-	if _restack_budget <= 0:
-		_disarm_restack()
-	else:
-		_restack_in_flight = false
 
 
 func _schedule_geom_sync(reason: String) -> void:
-	## 合并同一帧内多次 resized
 	if _geom_sync_queued:
 		return
 	_geom_sync_queued = true
@@ -491,33 +306,30 @@ func _schedule_geom_sync(reason: String) -> void:
 func _run_geom_sync(reason: String) -> void:
 	_geom_sync_queued = false
 	await get_tree().process_frame
-	if not _use_vte or _vte == null:
+	if not _use_embed or _embed == null:
 		return
-	_refresh_active_from_event("geom-" + reason)
+	_refresh_active("geom-" + reason)
 	if not _panel_slot_active():
 		return
-	if _term_placed and _vte.is_running() and _vte.is_attached():
-		_sync_geom_if_changed(reason)
-	elif _session_alive() or (_vte.is_running() and _editor_ready_seen):
+	if _term_placed and _embed.is_running() and _embed.is_attached():
+		_sync_geom_if_changed()
+	elif _session_alive() or (_embed.is_running() and _editor_ready_seen):
 		await _ensure_placed(false)
 
 
-func _sync_geom_if_changed(reason: String) -> void:
-	## 必须与 _apply_placed_geom 同路径（macOS rel / 其它 abs）。
-	## 旧逻辑 sync 时 set_geom 绝对坐标，HiDPI 下会漂到槽位左边。
-	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
-		_overlay_suppressed_by_popup = true
-		_hide_overlay("geom-sync")
+func _sync_geom_if_changed() -> void:
+	if _suppress_popup or _editor_blocks_overlay():
+		_suppress_popup = true
+		_embed.hide()
 		return
-	if not _term_placed or _vte == null or not _vte.is_running() or not _vte.is_attached():
+	if not _term_placed or _embed == null or not _embed.is_running() or not _embed.is_attached():
 		return
 	var r := _slot_screen_rect()
 	if r.size.x < 8 or r.size.y < 8:
 		return
 	if _geom_near(_last_geom, r):
 		return
-	if _apply_placed_geom():
-		_dbg("G-GEOM", "sync", {"reason": reason, "x": _last_geom.position.x, "y": _last_geom.position.y, "w": _last_geom.size.x, "h": _last_geom.size.y})
+	_apply_geom()
 
 
 func _geom_near(a: Rect2i, b: Rect2i) -> bool:
@@ -529,28 +341,24 @@ func _geom_near(a: Rect2i, b: Rect2i) -> bool:
 	)
 
 
-func _bootstrap_session_and_place() -> void:
+func _bootstrap() -> void:
 	if DisplayServer.get_name() == "headless":
 		return
 	if not _auto_started:
 		_auto_started = true
 		await _start_session_async(true, false)
-	# 等 dock 几何落地
 	for _i in range(6):
 		await get_tree().process_frame
 		if _panel_slot_active():
 			await _ensure_placed(false)
 			if _term_placed:
-				_set_status("终端已自动铺满")
 				return
 		await get_tree().create_timer(0.08).timeout
-	if _use_vte and _vte and _vte.is_running() and not _term_placed:
-		_hide_overlay("bootstrap")
-	_set_status("打开 Cursor Agent 页签后自动铺终端")
+	if _use_embed and _embed and _embed.is_running() and not _term_placed:
+		_embed.hide()
 
 
 func _panel_slot_active() -> bool:
-	## 底栏 / 左侧 / 右侧（Inspector 同槽）只要当前不是本页签就不算 active。
 	if not visible or not is_visible_in_tree():
 		return false
 	if not _is_current_tab_page():
@@ -562,7 +370,6 @@ func _panel_slot_active() -> bool:
 
 
 func _is_current_tab_page() -> bool:
-	## 沿父链找 TabContainer：当前 tab 必须是本面板所在页（Inspector 切走 → false）。
 	var n: Node = self
 	while n != null:
 		var p: Node = n.get_parent()
@@ -577,96 +384,144 @@ func _is_current_tab_page() -> bool:
 
 
 func _slot_screen_rect() -> Rect2i:
-	## 槽位屏幕矩形：交由 plat（Linux 原公式；macOS 用 screen_transform 防 HiDPI 算飞）
 	if _plat != null and _plat.has_method("slot_screen_rect"):
-		var r: Rect2i = _plat.slot_screen_rect(_slot)
-		_dbg("G-GEOM", "slot", {"x": r.position.x, "y": r.position.y, "w": r.size.x, "h": r.size.y, "os": _plat.os_id()})
-		return r
+		return _plat.slot_screen_rect(_slot)
 	return Rect2i()
 
 
-func _apply_placed_geom(allow_blur: bool = false) -> bool:
-	# 切到其它应用 / 弹层：禁止 show，否则会把 Godot 拽回前台。
-	# allow_blur：提示/弹层刚关掉，叠窗自己拿过焦点，仍要把终端铺回去。
-	if not allow_blur and (_overlay_suppressed_by_app_blur or not _editor_app_focused()):
+func _apply_geom(allow_blur: bool = false) -> bool:
+	if not allow_blur and (_suppress_blur or not _editor_focused()):
 		return false
-	if _overlay_suppressed_by_popup or _editor_blocks_overlay():
-		_overlay_suppressed_by_popup = true
-		_hide_overlay("apply-geom")
+	if _suppress_popup or _editor_blocks_overlay():
+		_suppress_popup = true
+		if _embed:
+			_embed.hide()
 		return false
-	if _vte == null or not _vte.is_running() or not _vte.is_attached():
+	if _embed == null or not _embed.is_running() or not _embed.is_attached():
 		return false
-	# macOS：相对槽位（宿主用 CGWindow 对齐）；其它平台：绝对屏幕矩形
-	if _vte.has_method("set_slot_geom") and _plat != null and _plat.has_method("slot_geom_dict"):
+	if _embed.has_method("set_slot_geom") and _plat != null and _plat.has_method("slot_geom_dict"):
 		var d: Dictionary = _plat.slot_geom_dict(_slot)
 		if d.is_empty() or float(d.get("fw", 0)) <= 0.0 or float(d.get("fh", 0)) <= 0.0:
-			_dbg("G-GEOM", "slot-too-small", {})
 			return false
 		_last_geom = Rect2i(int(d.get("x", 0)), int(d.get("y", 0)), int(d.get("w", 0)), int(d.get("h", 0)))
-		_vte.set_slot_geom(d)
-		_dbg("G-GEOM", "place-rel", d)
+		_embed.set_slot_geom(d)
 		return true
 	var r := _slot_screen_rect()
 	if r.size.x < 8 or r.size.y < 8:
-		_dbg("G-GEOM", "slot-too-small", {})
 		return false
 	_last_geom = r
-	_vte.set_geom(r.position.x, r.position.y, r.size.x, r.size.y)
-	_dbg("G-GEOM", "place", {"x": r.position.x, "y": r.position.y, "w": r.size.x, "h": r.size.y})
+	_embed.set_geom(r.position.x, r.position.y, r.size.x, r.size.y)
 	return true
 
 
+func _maybe_first_remount() -> void:
+	## 对齐 macOS：首次只 refresh/remount-paint，禁止 hide+show（WebKit 会黑）
+	if _first_remount_done or not _use_embed or _embed == null:
+		return
+	if not _editor_focused() or _suppress_popup or _suppress_blur:
+		return
+	_first_remount_done = true
+	_dbg("G-PLACE", "first-remount", {})
+	if _embed.has_method("remount"):
+		_embed.remount()
+	elif _embed.has_method("refresh_paint"):
+		_embed.refresh_paint()
+
+
 func _ensure_placed(force_restart_host: bool, grab_focus: bool = false) -> void:
-	## 铺 VTE 到当前槽位；默认不抢键盘（Alt+Tab / 几何同步只铺窗）。
-	## grab_focus：开启会话等主动操作才为 true。
-	## 有弹层时仍可启宿主，但必须 hide，避免误判成永久黑槽。
-	if not _use_vte or _vte == null:
-		_set_status("无 VTE")
+	if _place_busy:
+		return
+	if not _use_embed or _embed == null:
 		return
 	if not _panel_slot_active():
-		_set_status("请先打开 Cursor Agent 页签/dock")
 		return
-	var blocked := _overlay_suppressed_by_popup or _editor_blocks_overlay()
+	_place_busy = true
+	var blocked := _suppress_popup or _editor_blocks_overlay()
 	await get_tree().process_frame
 	await get_tree().process_frame
 
-	var had_child: bool = _vte.has_child()
-	if force_restart_host or not _vte.is_running():
-		if _vte.is_running():
-			_vte.stop_host()
+	var had_child: bool = _embed.has_child()
+	if force_restart_host or not _embed.is_running():
+		if _embed.is_running():
+			_embed.stop_host()
 			await get_tree().create_timer(0.05).timeout
-		var e: Error = _vte.start_host()
+		var e: Error = _embed.start_host()
 		if e != OK:
-			_set_status("VTE 宿主启动失败")
+			_place_busy = false
 			return
 		had_child = false
-	var att: Error = _vte.attach_to_godot()
+		_first_remount_done = false
+	var att: Error = _embed.attach_to_godot()
 	if att != OK:
-		_set_status("VTE 附着失败")
+		_place_busy = false
 		return
 
 	_term_placed = true
-	if blocked or _editor_blocks_overlay():
-		_overlay_suppressed_by_popup = true
-		_hide_overlay("ensure-placed")
-		_set_status("有编辑器弹层/正在运行 · 关闭后自动铺终端")
-		_dbg("G-PLACE", "deferred-by-popup", {})
-		return
-
-	if not _apply_placed_geom():
-		_set_status("槽位尺寸无效，请先拉大 dock 再试")
-		return
-
 	if not had_child or not _session_alive():
 		await _start_session_async(true, false)
-	await get_tree().process_frame
-	if not _editor_app_focused():
+
+	if blocked or _editor_blocks_overlay():
+		_suppress_popup = true
+		_embed.hide()
+		_place_busy = false
 		return
-	_apply_placed_geom()
-	_arm_restack("after-place")
-	if grab_focus and _editor_app_focused():
-		_focus_vte()
-	_dbg("G-PLACE", "ok", {"restart": force_restart_host, "grab": grab_focus, "w": _last_geom.size.x, "h": _last_geom.size.y})
+
+	if not _apply_geom():
+		_place_busy = false
+		return
+
+	await get_tree().process_frame
+	if not _editor_focused():
+		_place_busy = false
+		return
+	_apply_geom()
+	_maybe_first_remount()
+	if grab_focus and _editor_focused():
+		_embed.focus()
+	_place_busy = false
+
+
+func _on_slot_gui_input(event: InputEvent) -> void:
+	if event is InputEventMouseButton and event.pressed:
+		if _use_embed and _embed and _embed.is_running():
+			if _term_placed and _panel_slot_active():
+				_apply_geom()
+				_embed.focus()
+			else:
+				_ensure_placed(false, true)
+
+
+func _input(event: InputEvent) -> void:
+	if _use_embed:
+		return
+	if not visible or not is_visible_in_tree() or not _panel_slot_active():
+		return
+	if not (event is InputEventKey and event.pressed and not event.echo):
+		return
+	var k := event as InputEventKey
+	if k.keycode != KEY_V and k.physical_keycode != KEY_V:
+		return
+	if not k.ctrl_pressed or not _session_alive():
+		return
+	var text := DisplayServer.clipboard_get()
+	if text.is_empty():
+		return
+	_screen.stuff(_session_name(), text.replace("\n", "\r"))
+	get_viewport().set_input_as_handled()
+
+
+func _project_path() -> String:
+	return LauncherScript.project_root()
+
+
+func _session_name() -> String:
+	return LauncherScript.screen_session_name(_project_path())
+
+
+func _session_alive() -> bool:
+	if _use_embed:
+		return _embed != null and _embed.is_running() and _embed.has_child()
+	return _screen != null and _screen.is_alive(_session_name())
 
 
 func _on_start_session() -> void:
@@ -674,13 +529,9 @@ func _on_start_session() -> void:
 		_confirm_new_chat()
 		return
 	await _start_session_async(true, false)
-	if _use_vte:
+	if _use_embed:
 		if _panel_slot_active():
 			await _ensure_placed(false, true)
-		else:
-			if _vte and _vte.is_running():
-				_hide_overlay("start-inactive")
-			_set_status("会话已开 · 回到本页签即自动铺终端")
 
 
 func _confirm_new_chat() -> void:
@@ -698,24 +549,17 @@ func _confirm_new_chat() -> void:
 	dlg.popup_centered()
 
 
-func _session_alive() -> bool:
-	if _use_vte:
-		return _vte != null and _vte.is_running() and _vte.has_child()
-	return _screen.is_alive(_session_name())
-
-
 func _start_session_async(resume: bool, force_new: bool) -> void:
 	var project := _project_path()
 	var resume_id := ""
 	if not LauncherScript.agent_available():
-		_set_status("未找到 cursor-agent：请安装 CLI，或设 CURSOR_AGENT_PATH")
 		return
-
 	if force_new or not resume:
 		_store.invalidate(project)
 		_bound_session_id = ""
 		await _stop_session()
 		_term_placed = false
+		_first_remount_done = false
 	else:
 		resume_id = _store.find_last_session_id(project, _bound_session_id)
 
@@ -723,55 +567,50 @@ func _start_session_async(resume: bool, force_new: bool) -> void:
 	_session_started_at_ms = int(Time.get_unix_time_from_system() * 1000.0)
 
 	var err: Error = OK
-	if _use_vte:
-		err = await _start_vte_session(cmd, project)
+	if _use_embed:
+		err = await _start_embed_session(cmd, project)
 	else:
 		err = _screen.start(_session_name(), project, cmd)
-
 	if err != OK:
-		_set_status("启动失败（检查 cursor-agent / VTE）")
 		return
 
 	_bound_session_id = resume_id
 	if not resume_id.is_empty():
 		_store.record_active(project, resume_id)
 	_schedule_adopt(force_new or resume_id.is_empty())
-	if _use_vte:
+	if _use_embed:
 		if _term_placed:
-			_apply_placed_geom()
-			_focus_vte()
-			_set_status("resume=%s" % (resume_id if not resume_id.is_empty() else "新会话"))
+			_apply_geom()
+			_embed.focus()
 		elif _panel_slot_active():
 			await _ensure_placed(false, true)
 		else:
-			_hide_overlay("session-inactive")
-			_set_status("会话已开 · 回到本页签即铺终端")
+			_embed.hide()
 	elif force_new or not resume:
 		_on_open_terminal()
 
 
-func _start_vte_session(cmd: PackedStringArray, project: String) -> Error:
-	if _vte == null:
+func _start_embed_session(cmd: PackedStringArray, project: String) -> Error:
+	if _embed == null:
 		return FAILED
-	if not _vte.is_running():
-		var e: Error = _vte.start_host()
+	if not _embed.is_running():
+		var e: Error = _embed.start_host()
 		if e != OK:
 			return e
-	var att: Error = _vte.attach_to_godot()
+	var att: Error = _embed.attach_to_godot()
 	if att != OK:
-		_vte.stop_host()
+		_embed.stop_host()
 		return att
-	# geom 由 _ensure_placed / 自动同步负责
-	return _vte.spawn(cmd, project)
+	return _embed.spawn(cmd, project)
 
 
 func _stop_session() -> void:
-	if _use_vte and _vte:
-		_vte.stop_host()
+	if _use_embed and _embed:
+		_embed.stop_host()
 		_last_geom = Rect2i()
 		_term_placed = false
 		await get_tree().create_timer(0.15).timeout
-	elif _screen.is_alive(_session_name()):
+	elif _screen != null and _screen.is_alive(_session_name()):
 		_screen.stop(_session_name())
 		await get_tree().create_timer(0.25).timeout
 
@@ -788,57 +627,45 @@ func _schedule_adopt(require_fresh: bool) -> void:
 			)
 			if not adopted.is_empty() and adopted != _bound_session_id:
 				_bound_session_id = adopted
-				_set_status("chatId=%s" % adopted)
 		)
+
+
+func _on_inject_path() -> void:
+	var notation := EditorCtxScript.collect_at_notation()
+	_dbg("G-INJECT", "click", {"notation": notation, "alive": _session_alive()})
+	if notation.is_empty():
+		_dbg("G-INJECT", "empty-notation", {})
+		return
+	if not await _ensure_session():
+		_dbg("G-INJECT", "session-fail", {})
+		return
+	var payload := "\n" + notation + "\n"
+	if _use_embed:
+		var err: Error = _embed.write(payload)
+		# 注入后勿 focus 终端：会抢焦点导致第二次点按钮无效（4da6e60）
+		_dbg("G-INJECT", "wrote", {"err": err, "n": payload.length(), "text": notation})
+	else:
+		_screen.stuff(_session_name(), payload)
+		_dbg("G-INJECT", "screen-stuff", {"text": notation})
 
 
 func _ensure_session() -> bool:
 	if _session_alive():
 		return true
 	await _start_session_async(true, false)
-	if not _session_alive():
-		return false
-	# 刚 spawn 时 agent TUI 未就绪，立刻写入会丢
-	await get_tree().create_timer(0.4).timeout
 	return _session_alive()
 
 
-func _write_to_agent(text: String) -> Error:
-	if _use_vte:
-		if not _vte or not _vte.is_running():
-			return ERR_DOES_NOT_EXIST
-		return _vte.write(text)
-	return _screen.stuff(_session_name(), text)
-
-
-func _on_inject_path() -> void:
-	# 先采路径/选区（点按钮易失焦丢选区；缓存见 editor_ctx），再确保会话
-	var notation: String = EditorCtxScript.collect_at_notation()
-	if notation.is_empty():
-		_set_status("请先打开脚本")
-		return
-	if not await _ensure_session():
-		_set_status("会话未启动")
-		return
-	# 前后空行保持 \n…\n。注入后不再 focus：叠窗抢键后第二次点按钮易没反应
-	var err: Error = _write_to_agent("\n" + notation + "\n")
-	_set_status("已注入 %s" % notation if err == OK else "注入失败")
-
-
 func _on_scroll_bottom() -> void:
-	if _use_vte:
-		if not _vte or not _vte.is_running():
-			_set_status("会话未启动")
-			return
-		_vte.scroll_bottom()
-		_focus_vte()
-		return
-	_on_open_terminal()
+	if _use_embed and _embed and _embed.is_running():
+		_embed.scroll_bottom()
 
 
 func _on_open_terminal() -> void:
-	if not _screen.is_alive(_session_name()):
-		_set_status("无会话，请先开启")
+	if _screen == null:
 		return
-	var err: Error = _screen.open_system_terminal(_session_name())
-	_set_status("已打开系统终端" if err == OK else "打开终端失败")
+	if not _session_alive():
+		await _start_session_async(true, false)
+	if not _session_alive():
+		return
+	_screen.open_system_terminal(_session_name())

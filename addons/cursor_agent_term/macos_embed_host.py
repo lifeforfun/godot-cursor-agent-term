@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""macOS 专用内嵌终端宿主（仅 plat_macos / macos_bridge 使用）。
+"""macOS 专用内嵌终端宿主（仅 plat_macos / embed_bridge 使用）。
 
-无边框 NSPanel 叠在 Godot 槽位；WKWebView + xterm.js 渲染；真 PTY 跑 cursor-agent。
-TCP NDJSON 协议对齐 Linux vte_host。Linux / Windows 勿引用。
+无边框 NSPanel 叠在 Godot 槽位；WKWebView + xterm_web/macos.html；真 PTY 跑 cursor-agent。
+TCP NDJSON 协议对齐 Linux linux_embed_host。Linux / Windows 勿引用。
+页面与 Linux 隔离：只用 macos.html（含 IME 补交），不加载 linux.html。
 """
 from __future__ import annotations
 
@@ -55,7 +56,8 @@ def _dbg(tag: str, msg: str, **extra) -> None:
 
 
 def _assets_dir() -> Path:
-	return Path(__file__).resolve().parent / "macos_xterm"
+	## 与 Linux 共用 vendor（xterm.js/css）；页面用 macos.html
+	return Path(__file__).resolve().parent / "xterm_web"
 
 
 def main() -> None:
@@ -90,7 +92,7 @@ def main() -> None:
 	from objc import super as objc_super
 
 	assets = _assets_dir()
-	html_path = assets / "index.html"
+	html_path = assets / "macos.html"
 	_dbg("H-BOOT", "start", assets=str(assets), html=str(html_path), log=_DEBUG_PATH or "(off)")
 	if not html_path.is_file():
 		_dbg("H-BOOT", "missing-html")

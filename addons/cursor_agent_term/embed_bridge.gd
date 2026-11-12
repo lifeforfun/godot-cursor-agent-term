@@ -1,10 +1,16 @@
 @tool
-class_name CursorAgentVteBridge
+class_name CursorAgentEmbedBridge
 extends RefCounted
-## Linux 专用：启动 vte_host.py，经 TCP NDJSON 控制 VTE。仅由 plat_linux 引用。
+## 跨平台内嵌宿主桥：TCP NDJSON ↔ linux_embed_host / macos_embed_host。
+## 宿主脚本由 plat 注入；UI 只认本类 API。
 
-const HOST_SCRIPT := "res://addons/cursor_agent_term/vte_host.py"
+## vendor 共用；页面按平台隔离（linux.html / macos.html）
+const XTERM_JS := "res://addons/cursor_agent_term/xterm_web/xterm.js"
+const XTERM_LINUX := "res://addons/cursor_agent_term/xterm_web/linux.html"
+const XTERM_MACOS := "res://addons/cursor_agent_term/xterm_web/macos.html"
 
+var _host_script: String = ""
+var _python_bin: String = "python3"
 var _peer: StreamPeerTCP
 var _pid: int = -1
 var _port_file: String = ""
@@ -14,15 +20,59 @@ var _attached: bool = false
 var _rx: String = ""
 
 
-static func available() -> bool:
+func _init(host_script_res: String = "", python_bin: String = "python3") -> void:
+	_host_script = host_script_res
+	_python_bin = python_bin if not python_bin.is_empty() else "python3"
+
+
+static func _res_ok(res_path: String) -> bool:
+	return FileAccess.file_exists(ProjectSettings.globalize_path(res_path))
+
+
+static func xterm_vendor_ok() -> bool:
+	return (
+		_res_ok(XTERM_JS)
+		and _res_ok("res://addons/cursor_agent_term/xterm_web/xterm.css")
+		and _res_ok("res://addons/cursor_agent_term/xterm_web/addon-fit.js")
+	)
+
+
+static func linux_ok() -> bool:
+	if not xterm_vendor_ok() or not _res_ok(XTERM_LINUX):
+		return false
+	var script := ProjectSettings.globalize_path("res://addons/cursor_agent_term/linux_embed_host.py")
+	if not FileAccess.file_exists(script):
+		return false
 	var out: Array = []
 	var code := OS.execute(
 		"python3",
-		[
+		PackedStringArray([
 			"-c",
-			"import gi; gi.require_version('Gtk','3.0'); gi.require_version('Vte','2.91'); "
-			+ "from gi.repository import Gtk,Vte; print('ok')",
-		],
+			"import gi; gi.require_version('Gtk','3.0'); gi.require_version('WebKit2','4.1'); "
+			+ "from gi.repository import Gtk,WebKit2; print('ok')",
+		]),
+		out,
+		true,
+	)
+	if code != 0:
+		return false
+	return "\n".join(out).contains("ok")
+
+
+static func macos_ok(python_bin: String) -> bool:
+	if OS.get_name() != "macOS":
+		return false
+	if not xterm_vendor_ok() or not _res_ok(XTERM_MACOS):
+		return false
+	var script := ProjectSettings.globalize_path("res://addons/cursor_agent_term/macos_embed_host.py")
+	if not FileAccess.file_exists(script):
+		return false
+	if python_bin.is_empty() or not FileAccess.file_exists(python_bin):
+		return false
+	var out: Array = []
+	var code := OS.execute(
+		python_bin,
+		PackedStringArray(["-c", "from AppKit import NSWindow; import WebKit; print('ok')"]),
 		out,
 		true,
 	)
@@ -42,54 +92,60 @@ func has_child() -> bool:
 func start_host() -> Error:
 	if is_running():
 		return OK
-	var script := ProjectSettings.globalize_path(HOST_SCRIPT)
+	if _host_script.is_empty():
+		return ERR_INVALID_PARAMETER
+	var script := ProjectSettings.globalize_path(_host_script)
 	if not FileAccess.file_exists(script):
-		push_error("cursor_agent_term: 缺少 vte_host.py")
+		push_error("cursor_agent_term: 缺少宿主 %s" % script)
 		return ERR_FILE_NOT_FOUND
+	if not FileAccess.file_exists(_python_bin) and _python_bin != "python3":
+		# python3 走 PATH
+		if _python_bin.contains("/"):
+			push_error("cursor_agent_term: Python 不存在 %s" % _python_bin)
+			return ERR_FILE_NOT_FOUND
 
-	_port_file = OS.get_temp_dir().path_join("gcat_vte_%s.port" % str(Time.get_ticks_msec()))
+	_port_file = OS.get_temp_dir().path_join("gcat_embed_%s.port" % str(Time.get_ticks_msec()))
 	if FileAccess.file_exists(_port_file):
 		DirAccess.remove_absolute(_port_file)
 
-	_pid = OS.create_process("python3", PackedStringArray([script, _port_file]))
+	_pid = OS.create_process(_python_bin, PackedStringArray([script, _port_file]))
 	if _pid <= 0:
-		push_error("cursor_agent_term: 无法启动 vte_host.py")
+		push_error("cursor_agent_term: 无法启动宿主")
 		return FAILED
 
-	var port := _wait_port(3000)
+	var port := _wait_port(5000)
 	if port <= 0:
-		push_error("cursor_agent_term: VTE 端口未就绪")
+		push_error("cursor_agent_term: 宿主端口未就绪")
 		stop_host()
 		return ERR_TIMEOUT
 
 	_peer = StreamPeerTCP.new()
 	var err := _peer.connect_to_host("127.0.0.1", port)
 	if err != OK:
-		push_error("cursor_agent_term: 连接 VTE 失败 %s" % err)
+		push_error("cursor_agent_term: 连接宿主失败 %s" % err)
 		stop_host()
 		return err
 
-	var deadline := Time.get_ticks_msec() + 3000
+	var deadline := Time.get_ticks_msec() + 4000
 	while Time.get_ticks_msec() < deadline:
 		_peer.poll()
 		if _peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
 			break
 		OS.delay_msec(20)
 	if _peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
-		push_error("cursor_agent_term: VTE TCP 未连通")
+		push_error("cursor_agent_term: 宿主 TCP 未连通")
 		stop_host()
 		return ERR_CANT_CONNECT
 
 	_alive = true
 	_child_alive = false
 	_attached = false
-	deadline = Time.get_ticks_msec() + 3000
+	deadline = Time.get_ticks_msec() + 4000
 	while Time.get_ticks_msec() < deadline:
 		var ev := poll_event()
 		if ev.get("event") == "ready":
 			return OK
 		OS.delay_msec(20)
-	# 已连通即可用
 	return OK
 
 
@@ -112,7 +168,6 @@ func stop_host() -> void:
 
 
 func attach_to_godot() -> Error:
-	## transient 挂到编辑器窗口（叠在槽位上；不能 reparent，会被 GPU 帧缓冲盖住）。
 	if not is_running():
 		return ERR_DOES_NOT_EXIST
 	if _attached:
@@ -130,7 +185,6 @@ func attach_to_godot() -> Error:
 			push_error("cursor_agent_term: attach %s" % str(ev.get("message", "")))
 			return FAILED
 		OS.delay_msec(10)
-	# 宿主若已存活，即使回包丢失也继续（geom/spawn 仍可用）
 	push_warning("cursor_agent_term: attach 回包超时，继续尝试显示")
 	_attached = true
 	return OK
@@ -141,8 +195,15 @@ func is_attached() -> bool:
 
 
 func set_geom(x: int, y: int, w: int, h: int) -> void:
-	## 屏幕绝对坐标。
 	_send({"cmd": "geom", "x": x, "y": y, "w": w, "h": h})
+
+
+func set_slot_geom(d: Dictionary) -> void:
+	var msg := {"cmd": "geom", "mode": str(d.get("mode", "rel"))}
+	for k in ["fx", "fy", "fw", "fh", "x", "y", "w", "h"]:
+		if d.has(k):
+			msg[k] = d[k]
+	_send(msg)
 
 
 func hide() -> void:
@@ -150,7 +211,6 @@ func hide() -> void:
 
 
 func remount() -> void:
-	## 软 hide+show：首次铺在 Godot Vulkan 上时常黑窗，需 remap 一次
 	_send({"cmd": "remount"})
 
 
@@ -183,11 +243,13 @@ func spawn(argv: PackedStringArray, cwd: String) -> Error:
 			_child_alive = true
 			return OK
 		if name == "error":
+			_child_alive = false
 			push_error("cursor_agent_term: spawn %s" % str(ev.get("message", "")))
 			return FAILED
 		OS.delay_msec(20)
-	_child_alive = true
-	return OK
+	_child_alive = false
+	push_error("cursor_agent_term: spawn 超时")
+	return ERR_TIMEOUT
 
 
 func write(text: String) -> Error:
@@ -202,7 +264,6 @@ func send_image_paste() -> Error:
 
 
 func paste() -> Error:
-	## 宿主内判断：有图 → 规范化 PNG + 0x16；有文本 → 写入 PTY。
 	if not is_running():
 		return ERR_DOES_NOT_EXIST
 	_send({"cmd": "paste"})

@@ -1,27 +1,40 @@
 @tool
 class_name CursorAgentPlatMacos
 extends "res://addons/cursor_agent_term/plat_base.gd"
-## macOS：内嵌 WKWebView/xterm 叠窗（macos_bridge）+ tmux/screen 外挂回退。
-## 逻辑只准写在本文件及 macos_* 宿主；禁止改 Linux VTE 路径。
+## macOS：WKWebView + xterm_web/macos.html + tmux/screen 外挂回退。
 
 
-const MacosBridgeScript := preload("res://addons/cursor_agent_term/macos_bridge.gd")
+const EmbedBridgeScript := preload("res://addons/cursor_agent_term/embed_bridge.gd")
 const MacosHostScript := preload("res://addons/cursor_agent_term/macos_host.gd")
 const ExtStubScript := preload("res://addons/cursor_agent_term/ext_host_stub.gd")
+const HOST_SCRIPT := "res://addons/cursor_agent_term/macos_embed_host.py"
 
 
 func os_id() -> String:
 	return "macos"
 
 
+func _venv_python() -> String:
+	var env_py := OS.get_environment("GCAT_MACOS_PYTHON").strip_edges()
+	if not env_py.is_empty() and FileAccess.file_exists(env_py):
+		return env_py
+	var h := home()
+	if h.is_empty():
+		return ""
+	var p := h.path_join(".cache/cursor-agent-term/macos-venv/bin/python")
+	if FileAccess.file_exists(p):
+		return p
+	return ""
+
+
 func embed_ok() -> bool:
-	return MacosBridgeScript.available()
+	return EmbedBridgeScript.macos_ok(_venv_python())
 
 
 func new_embed() -> RefCounted:
 	if not embed_ok():
 		return null
-	return MacosBridgeScript.new()
+	return EmbedBridgeScript.new(HOST_SCRIPT, _venv_python())
 
 
 func fallback_ok() -> bool:
@@ -32,15 +45,6 @@ func new_fallback() -> RefCounted:
 	if fallback_ok():
 		return MacosHostScript.new()
 	return ExtStubScript.new(os_id())
-
-
-func which(name: String) -> String:
-	if name.is_empty() or name.contains("/") or name.contains(" "):
-		return ""
-	var out: Array = []
-	if OS.execute("sh", ["-c", "command -v %s" % name], out, true) != 0 or out.is_empty():
-		return ""
-	return str(out[0]).strip_edges()
 
 
 func shell() -> String:
@@ -57,15 +61,6 @@ func term_bins() -> PackedStringArray:
 
 func clip_img_ok() -> bool:
 	return not which("osascript").is_empty()
-
-
-func agent_path_candidates() -> PackedStringArray:
-	return PackedStringArray([
-		".local/bin/cursor-agent",
-		".local/bin/agent",
-		".cursor/bin/cursor-agent",
-		".cursor/bin/agent",
-	])
 
 
 func agent_abs_candidates() -> PackedStringArray:
@@ -107,7 +102,6 @@ func slot_geom_dict(slot: Control) -> Dictionary:
 	var fy: float = gr.position.y / vr.size.y
 	var fw: float = gr.size.x / vr.size.x
 	var fh: float = gr.size.y / vr.size.y
-	# 绝对坐标仅日志
 	var xf: Transform2D = vp.get_screen_transform()
 	var tl: Vector2 = xf * gr.position
 	var br: Vector2 = xf * (gr.position + gr.size)

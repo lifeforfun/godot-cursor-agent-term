@@ -112,8 +112,8 @@ check_plugin_src() {
   if [[ ! -f "$SRC/cursor_agent_term/plugin.cfg" ]]; then
     err "缺少 plugin.cfg：$SRC/cursor_agent_term/plugin.cfg"
   fi
-  if [[ ! -f "$SRC/cursor_agent_term/vte_host.py" ]]; then
-    err "缺少 vte_host.py（Linux 内嵌终端宿主）"
+  if [[ ! -f "$SRC/cursor_agent_term/xterm_web/xterm.js" ]]; then
+    err "缺少 xterm_web/xterm.js（共享 vendor）"
   fi
   local uname_s
   uname_s="$(uname -s 2>/dev/null || echo unknown)"
@@ -121,8 +121,15 @@ check_plugin_src() {
     if [[ ! -f "$SRC/cursor_agent_term/macos_embed_host.py" ]]; then
       err "缺少 macos_embed_host.py（macOS 内嵌终端宿主）"
     fi
-    if [[ ! -f "$SRC/cursor_agent_term/macos_xterm/index.html" ]]; then
-      err "缺少 macos_xterm/index.html（macOS xterm 资源）"
+    if [[ ! -f "$SRC/cursor_agent_term/xterm_web/macos.html" ]]; then
+      err "缺少 xterm_web/macos.html（macOS 专用页）"
+    fi
+  else
+    if [[ ! -f "$SRC/cursor_agent_term/linux_embed_host.py" ]]; then
+      err "缺少 linux_embed_host.py（Linux 内嵌终端宿主）"
+    fi
+    if [[ ! -f "$SRC/cursor_agent_term/xterm_web/linux.html" ]]; then
+      err "缺少 xterm_web/linux.html（Linux 专用页）"
     fi
   fi
 }
@@ -246,7 +253,7 @@ check_agent() {
 
 check_python() {
   if ! have_cmd python3; then
-    err "未找到 python3（安装脚本与 VTE 宿主都需要）"
+    err "未找到 python3（安装脚本与内嵌宿主都需要）"
     return
   fi
   local pyv
@@ -257,18 +264,18 @@ check_python() {
 }
 
 check_term_runtime_linux() {
-  local vte_ok=0 screen_ok=0 term_ok=0
+  local webkit_ok=0 screen_ok=0 term_ok=0
 
   if have_cmd python3; then
     if python3 - <<'PY' >/dev/null 2>&1
 import gi
 gi.require_version("Gtk", "3.0")
-gi.require_version("Vte", "2.91")
-from gi.repository import Gtk, Vte  # noqa: F401
+gi.require_version("WebKit2", "4.1")
+from gi.repository import Gtk, WebKit2  # noqa: F401
 print("ok")
 PY
     then
-      vte_ok=1
+      webkit_ok=1
     fi
   fi
 
@@ -281,17 +288,17 @@ PY
     if have_cmd "$t"; then term_ok=1; break; fi
   done
 
-  if (( vte_ok == 1 )); then
+  if (( webkit_ok == 1 )); then
     :
   elif (( screen_ok == 1 && term_ok == 1 )); then
-    warn "未检测到 VTE（python3-gi + Vte 2.91）：将只能使用 screen 外挂终端回退"
+    warn "未检测到 WebKitGTK（python3-gi + gir1.2-webkit2-4.1）：将只能使用 screen 外挂终端回退"
   elif (( screen_ok == 1 && term_ok == 0 )); then
-    err "有 screen 但未找到终端模拟器（gnome-terminal / kitty / xterm 等）；请安装 VTE 或任一终端"
+    err "有 screen 但未找到终端模拟器（gnome-terminal / kitty / xterm 等）；请安装 WebKitGTK 或任一终端"
   else
-    err "运行环境不足：需要「python3-gi + gir1.2-vte-2.91」内嵌终端，或「screen + 终端模拟器」回退"
+    err "运行环境不足：需要「python3-gi + gir1.2-webkit2-4.1」内嵌 xterm，或「screen + 终端模拟器」回退"
   fi
 
-  if (( vte_ok == 1 )) && ! have_cmd xclip; then
+  if (( webkit_ok == 1 )) && ! have_cmd xclip; then
     warn "未找到 xclip：剪贴板贴图可能不稳定（建议：sudo apt install xclip）"
   fi
 
@@ -377,10 +384,10 @@ run_checks() {
       echo "  Terminal:  $( [[ -d /System/Applications/Utilities/Terminal.app || -d /Applications/Utilities/Terminal.app || -d /Applications/Terminal.app ]] && echo 有 || echo 无 )"
       ;;
     *)
-      if have_cmd python3 && python3 -c 'import gi; gi.require_version("Gtk","3.0"); gi.require_version("Vte","2.91"); from gi.repository import Gtk,Vte' >/dev/null 2>&1; then
-        echo "  内嵌 VTE:  可用"
+      if have_cmd python3 && python3 -c 'import gi; gi.require_version("Gtk","3.0"); gi.require_version("WebKit2","4.1"); from gi.repository import Gtk,WebKit2' >/dev/null 2>&1; then
+        echo "  内嵌 xterm: 可用 (WebKitGTK)"
       else
-        echo "  内嵌 VTE:  不可用"
+        echo "  内嵌 xterm: 不可用"
       fi
       echo "  screen:    $(command -v screen 2>/dev/null || echo 无)"
       echo "  xclip:     $(command -v xclip 2>/dev/null || echo 无)"

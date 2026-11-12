@@ -17,7 +17,7 @@ func embed_ok() -> bool:
 
 
 func new_embed() -> RefCounted:
-	# TODO: 返回 Windows 内嵌桥（对标 vte_bridge.gd）
+	# TODO: WebView2 + xterm_web + ConPTY（对标 embed_bridge）
 	return null
 
 
@@ -79,4 +79,4 @@ func agent_path_candidates() -> PackedStringArray:
 
 
 func hint() -> String:
-	return "Windows 终端宿主尚未实现（plat_windows）；目前仅 Linux 支持内嵌 VTE"
+	return "Windows 终端宿主尚未实现（plat_windows）；Linux/macOS 为 xterm.js 内嵌"

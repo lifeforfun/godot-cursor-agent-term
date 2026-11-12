@@ -1,7 +1,7 @@
 @tool
 class_name CursorAgentDock
 extends EditorDock
-## 编辑器 dock 的固定回调 → 信号，供面板事件驱动同步 VTE（不靠轮询猜尺寸）。
+## 编辑器 dock 的固定回调 → 信号，供面板事件驱动同步叠窗几何。
 
 signal dock_layout_changed(layout: int)
 signal dock_geom_changed(reason: String)

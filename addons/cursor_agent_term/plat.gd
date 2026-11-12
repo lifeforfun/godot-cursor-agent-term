@@ -21,7 +21,7 @@ static func get_plat() -> RefCounted:
 		"Linux", "FreeBSD", "NetBSD", "OpenBSD":
 			_inst = LinuxScript.new()
 		_:
-			# 未知 Unix 先走 Linux 探测（VTE/screen）；不行由 hint 提示
+			# 未知 Unix 先走 Linux 探测（WebKit/xterm + screen）
 			_inst = LinuxScript.new()
 	return _inst
 

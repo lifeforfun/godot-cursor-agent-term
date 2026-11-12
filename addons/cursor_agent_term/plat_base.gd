@@ -9,22 +9,22 @@ func os_id() -> String:
 
 
 func embed_ok() -> bool:
-	## 编辑器内嵌终端（Linux=VTE 浮层）
+	## 编辑器内嵌终端（xterm.js 叠窗）
 	return false
 
 
 func new_embed() -> RefCounted:
-	## 返回与 CursorAgentVteBridge 同协议的对象；不可用则 null
+	## 返回 CursorAgentEmbedBridge；不可用则 null
 	return null
 
 
 func fallback_ok() -> bool:
-	## 外挂终端回退（Linux=GNU screen）
+	## 外挂终端回退（Linux=GNU screen / macOS=tmux|screen）
 	return false
 
 
 func new_fallback() -> RefCounted:
-	## 返回与 CursorAgentScreenHost 同协议的对象；不可用则 null
+	## screen/tmux 外挂宿主；不可用则 null
 	return null
 
 
